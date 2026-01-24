@@ -1,0 +1,33 @@
+from aiogram.fsm.state import State, StatesGroup
+
+
+class AdminStates(StatesGroup):
+    # Gain Alerts
+    gain_alerts_add_type = State()
+    gain_alerts_add_chat_id = State()
+    gain_alerts_add_user_id = State()
+    gain_alerts_confirm_add = State()
+    gain_alerts_edit_name = State()
+    gain_alerts_edit_sensitivity = State()
+    gain_alerts_edit_template = State()
+    gain_alerts_edit_sender = State()
+    gain_alerts_edit_chart_threshold = State()
+    gain_alerts_edit_chart_bot = State()
+    gain_alerts_add_chart_group = State()
+    gain_alerts_remove_chart_group = State()
+    chart_groups_add_chat_id = State()
+    awaiting_gain_threshold = State()
+    awaiting_gain_template = State()
+    awaiting_global_chart_threshold = State()
+    awaiting_global_chart_bot = State()
+    awaiting_chart_guardrails = State()
+    awaiting_drop_threshold = State()
+    awaiting_drop_floor = State()
+    awaiting_guardrail_value = State()
+    awaiting_source_guardrail_override = State()
+
+    # Userbots
+    userbot_login_phone = State()
+    userbot_login_code = State()
+    userbot_login_2fa = State()
+    userbot_set_name = State()
