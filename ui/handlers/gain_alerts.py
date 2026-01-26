@@ -18,6 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from models import (
+    AnalyticsModel,
     MonitoredSourceModel,
     SettingsModel,
     ChartRequestGroupModel,
@@ -37,13 +38,14 @@ class GainAlertsHandler(ChartAndSettingsMixin):
     def __init__(self, db_pool):
         self.db = db_pool
         self.model = MonitoredSourceModel(db_pool)
+        self.analytics_model = AnalyticsModel(db_pool)
         self.settings_model = SettingsModel(db_pool)
         self.chart_groups = ChartRequestGroupModel(db_pool)
         self.keyboards = Keyboards()
         self._member_display_cache: Dict[tuple[int, int], str] = {}
         self._chart_bot_cache: Dict[int, Optional[str]] = {}
 
-    async def show_main_menu(self, query: types.CallbackQuery, state: Optional[FSMContext] = None) -> None:
+    async def show_main_menu(self, query: types.CallbackQuery, state: Optional[FSMContext] = None, page: int = 1) -> None:
         try:
             if state:
                 await state.clear()
@@ -55,21 +57,45 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             target_lookup = {record["chat_id"]: record["label"] for record in known_targets}
 
             grouped = self._group_sources(sources)
-            text = self._format_sources_overview(grouped, userbot_lookup, target_lookup)
             menu_entries = self._summaries_for_menu(grouped, userbot_lookup)
+            page_size = 9
+            total_pages = max(1, (len(menu_entries) + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+            start = (page - 1) * page_size
+            end = start + page_size
+            paginated_entries = menu_entries[start:end]
+            page_chat_ids = [entry["chat_id"] for entry in paginated_entries]
+            text = self._format_sources_overview(
+                grouped,
+                userbot_lookup,
+                target_lookup,
+                page_chat_ids=page_chat_ids,
+                page=page,
+                total_pages=total_pages,
+            )
 
             await query.message.edit_text(
                 text,
-                reply_markup=self.keyboards.gain_alerts_main_menu(menu_entries),
+                reply_markup=self.keyboards.gain_alerts_main_menu(
+                    paginated_entries,
+                    page=page,
+                    total_pages=total_pages,
+                ),
                 parse_mode="HTML",
             )
         except Exception as exc:
             logger.error("Error showing gain alerts menu: %s", exc, exc_info=True)
             await query.answer("❌ Failed to load gain alerts", show_alert=True)
 
-    async def show_chart_groups_menu(self, query: types.CallbackQuery) -> None:
+    async def show_chart_groups_menu(self, query: types.CallbackQuery, page: int = 1) -> None:
         try:
             groups = await self.chart_groups.list_all()
+            page_size = 9
+            total_pages = max(1, (len(groups) + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+            start = (page - 1) * page_size
+            end = start + page_size
+            paginated_groups = groups[start:end]
 
             lines = [
                 "<b>📊 Chart Request Groups</b>",
@@ -77,9 +103,12 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 "Groups where bot can post CA to fetch charts:",
                 "",
             ]
+            if total_pages > 1:
+                lines.append(f"Page {page}/{total_pages}")
+                lines.append("")
 
             if groups:
-                for group in groups:
+                for group in paginated_groups:
                     chat_id = group["chat_id"]
                     label = group.get("label")
                     if label:
@@ -90,7 +119,11 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 lines.append("No chart request groups configured yet.")
 
             text = "\n".join(lines)
-            keyboard = self.keyboards.chart_groups_menu(groups)
+            keyboard = self.keyboards.chart_groups_menu(
+                paginated_groups,
+                page=page,
+                total_pages=total_pages,
+            )
 
             await query.message.edit_text(
                 text,
@@ -251,7 +284,8 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             await message.answer(
                 "<b>👥 Monitor Group Members</b>\n\n"
                 "Enter one or more Telegram user IDs to monitor in this group.\n"
-                "User IDs must be positive integers. Separate multiple IDs with commas or spaces.",
+                "User IDs must be positive integers. Separate multiple IDs with commas or spaces.\n\n"
+                "To monitor the entire group, reply with <code>all</code>.",
                 reply_markup=self.keyboards.cancel_button("gain_alerts:cancel"),
             )
             await state.update_data(user_ids=[])
@@ -269,6 +303,17 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         if not chat_id or chat_type != "group":
             await message.answer("❌ Session expired. Please restart the add flow.")
             await state.clear()
+            return
+
+        raw_input = (message.text or "").strip().lower()
+        if raw_input in {"all", "*", "everyone", "any"}:
+            existing_all = await self.model.is_monitored(chat_id, None)
+            if existing_all and existing_all.get("chat_type") == "group":
+                await message.answer("⚠️ This group is already tracking all users.")
+                return
+            await state.update_data(user_ids=[], skipped_user_ids=[], track_all_users=True)
+            await state.set_state(AdminStates.gain_alerts_confirm_add)
+            await self._show_add_confirmation(message, state)
             return
 
         parsed_ids = self._parse_int_list(message.text)
@@ -305,7 +350,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             )
             return
 
-        await state.update_data(user_ids=new_ids, skipped_user_ids=existing_ids)
+        await state.update_data(user_ids=new_ids, skipped_user_ids=existing_ids, track_all_users=False)
         await state.set_state(AdminStates.gain_alerts_confirm_add)
         await self._show_add_confirmation(message, state)
 
@@ -314,11 +359,14 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         chat_type = data.get("chat_type")
         chat_id = data.get("chat_id")
         user_id = data.get("user_id")
+        track_all_users = bool(data.get("track_all_users"))
 
         user_ids: List[Optional[int]] = []
         if chat_type == "group":
             stored_ids = data.get("user_ids")
-            if stored_ids:
+            if track_all_users:
+                user_ids = [None]
+            elif stored_ids:
                 user_ids = [int(uid) for uid in stored_ids]
             elif user_id is not None:
                 user_ids = [int(user_id)]
@@ -327,7 +375,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         else:
             user_ids = [None]
 
-        if chat_type is None or chat_id is None or (chat_type == "group" and not user_ids):
+        if chat_type is None or chat_id is None or (chat_type == "group" and not user_ids and not track_all_users):
             await query.answer("❌ Missing data. Please start again.", show_alert=True)
             await state.clear()
             return
@@ -390,6 +438,49 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         except Exception as exc:
             logger.error("Error showing gain alert source detail for %s: %s", chat_id, exc, exc_info=True)
             await query.answer("❌ Failed to load source detail", show_alert=True)
+
+    async def show_source_stats(self, query: types.CallbackQuery, chat_id: int, timeframe: str = "24h") -> None:
+        """Show performance statistics for a monitored source."""
+        try:
+            from datetime import datetime, timedelta, timezone
+
+            # Get source info
+            sources = await self.model.get_by_chat(chat_id)
+            source = sources[0] if sources else None
+            if not source:
+                await query.answer("Source not found.", show_alert=True)
+                return
+
+            source_id = source["id"]
+            display_name = source.get("display_name", f"Chat {chat_id}")
+
+            # Parse timeframe to timedelta
+            timeframe_map = {
+                "1h": timedelta(hours=1),
+                "24h": timedelta(hours=24),
+                "7d": timedelta(days=7),
+                "30d": timedelta(days=30),
+            }
+
+            duration = timeframe_map.get(timeframe, timedelta(hours=24))
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - duration
+
+            # Calculate stats
+            stats = await self.analytics_model.calculate_source_stats(
+                chat_id, None, start_time, end_time
+            )
+
+            # Format display
+            text = self._format_source_stats(display_name, stats, timeframe)
+            keyboard = self._build_stats_keyboard(chat_id, timeframe)
+
+            await query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+            await query.answer()
+
+        except Exception as exc:
+            logger.error("Error showing stats for source %s: %s", chat_id, exc, exc_info=True)
+            await query.answer("❌ Failed to load stats", show_alert=True)
 
     async def cancel(self, query: types.CallbackQuery, state: FSMContext) -> None:
         try:
@@ -1030,9 +1121,9 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             source_chat_id=int(chat_id),
         )
 
-    async def show_tracked_users(self, query: types.CallbackQuery, chat_id: int) -> None:
+    async def show_tracked_users(self, query: types.CallbackQuery, chat_id: int, page: int = 1) -> None:
         try:
-            view = await self._build_tracked_users_view(query.bot, chat_id)
+            view = await self._build_tracked_users_view(query.bot, chat_id, page=page)
             if view is None:
                 await query.answer("No tracked users.", show_alert=True)
                 return
@@ -1061,6 +1152,79 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         except Exception as exc:
             logger.error("Error removing monitored user %s: %s", source_id, exc, exc_info=True)
             await query.answer("❌ Failed to remove monitored user", show_alert=True)
+
+    async def toggle_track_all_users(self, query: types.CallbackQuery, chat_id: int) -> None:
+        try:
+            records = await self.model.get_by_chat(chat_id)
+            if not records:
+                await query.answer("Monitored source not found.", show_alert=True)
+                return
+
+            entry = self._summarise_records(records)
+            if entry.get("chat_type") != "group":
+                await query.answer("Track-all is only available for groups.", show_alert=True)
+                return
+
+            existing_all = next(
+                (record for record in records if record.get("chat_type") == "group" and record.get("user_id") is None),
+                None,
+            )
+
+            if existing_all:
+                removed = await self.model.delete_source_row(existing_all["id"])
+                if removed:
+                    await query.answer("✅ Track-all disabled for this group.", show_alert=False)
+                else:
+                    await query.answer("⚠️ Track-all already disabled.", show_alert=True)
+            else:
+                new_record = await self.model.add_source(
+                    chat_id=chat_id,
+                    chat_type="group",
+                    user_id=None,
+                    admin_id=query.from_user.id,
+                )
+                if new_record and records:
+                    base = records[0]
+                    await self.model.update_source_fields(
+                        new_record["id"],
+                        display_name=base.get("display_name"),
+                        is_enabled=base.get("is_enabled"),
+                        sensitivity_pct=base.get("sensitivity_pct"),
+                        assigned_userbot_id=base.get("assigned_userbot_id"),
+                        template_text=base.get("template_text"),
+                        use_management_bot=base.get("use_management_bot"),
+                        chart_enabled=base.get("chart_enabled"),
+                        chart_bot_id=base.get("chart_bot_id"),
+                        chart_mc_threshold=base.get("chart_mc_threshold"),
+                        chart_min_age_minutes=base.get("chart_min_age_minutes"),
+                        chart_min_liquidity_usd=base.get("chart_min_liquidity_usd"),
+                        chart_min_volume_usd=base.get("chart_min_volume_usd"),
+                        chart_min_multiplier=base.get("chart_min_multiplier"),
+                        chart_max_price_change_pct=base.get("chart_max_price_change_pct"),
+                        chart_checks_required=base.get("chart_checks_required"),
+                        tracking_userbot_id=base.get("tracking_userbot_id"),
+                        tracking_fallback_enabled=base.get("tracking_fallback_enabled"),
+                    )
+                await query.answer("✅ Track-all enabled for this group.", show_alert=False)
+
+            await self.show_source_detail(query, chat_id)
+        except Exception as exc:
+            logger.error("Error toggling track-all for %s: %s", chat_id, exc, exc_info=True)
+            await query.answer("❌ Failed to toggle track-all", show_alert=True)
+
+    async def toggle_user_exclusion(self, query: types.CallbackQuery, chat_id: int, user_id: int, page: int = 1) -> None:
+        try:
+            excluded = await self.model.is_user_excluded(chat_id, user_id)
+            if excluded:
+                await self.model.remove_exclusion(chat_id, user_id)
+                await query.answer("✅ User re-included.", show_alert=False)
+            else:
+                await self.model.add_exclusion(chat_id, user_id)
+                await query.answer("🚫 User excluded.", show_alert=False)
+            await self.show_tracked_users(query, chat_id, page=page)
+        except Exception as exc:
+            logger.error("Error toggling exclusion for %s/%s: %s", chat_id, user_id, exc, exc_info=True)
+            await query.answer("❌ Failed to update exclusion", show_alert=True)
 
     async def start_remove_chat(self, query: types.CallbackQuery, chat_id: int) -> None:
         try:
@@ -1129,12 +1293,15 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         skipped = data.get("skipped_user_ids") or []
 
         if chat_type == "group":
-            user_lines = []
-            if user_ids:
-                user_lines.append("Users to add: " + ", ".join(str(uid) for uid in user_ids))
-            if skipped:
-                user_lines.append("Skipped existing: " + ", ".join(str(uid) for uid in skipped))
-            user_block = "\n".join(user_lines) if user_lines else "No users provided yet."
+            if data.get("track_all_users"):
+                user_block = "Scope: all group members"
+            else:
+                user_lines = []
+                if user_ids:
+                    user_lines.append("Users to add: " + ", ".join(str(uid) for uid in user_ids))
+                if skipped:
+                    user_lines.append("Skipped existing: " + ", ".join(str(uid) for uid in skipped))
+                user_block = "\n".join(user_lines) if user_lines else "No users provided yet."
         else:
             user_block = "Scope: whole chat"
 
@@ -1163,6 +1330,11 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         return f"{ctype} {chat_id}"
 
     def _summarise_records(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        track_all_record = next(
+            (r for r in records if r.get("chat_type") == "group" and r.get("user_id") is None),
+            None,
+        )
+        token_sum = track_all_record.get("token_count") if track_all_record else records[0].get("token_count")
         entry = {
             "chat_id": records[0].get("chat_id"),
             "chat_type": records[0].get("chat_type"),
@@ -1175,7 +1347,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             "use_management_bot": records[0].get("use_management_bot") or False,
             "assigned_userbot_id": records[0].get("assigned_userbot_id"),
             "tracked_user_count": sum(1 for r in records if r.get("user_id") is not None),
-            "token_sum": records[0].get("token_count") or 0,
+            "token_sum": token_sum or 0,
             "chart_enabled": bool(records[0].get("chart_enabled")),
             "chart_mc_threshold": records[0].get("chart_mc_threshold"),
             "chart_bot_id": records[0].get("chart_bot_id"),
@@ -1184,6 +1356,9 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             "tracking_userbot_id": records[0].get("tracking_userbot_id"),
             "tracking_fallback_enabled": records[0].get("tracking_fallback_enabled", True),
         }
+        entry["track_all_users"] = any(
+            r.get("chat_type") == "group" and r.get("user_id") is None for r in records
+        )
         entry["sensitivity_text"] = (
             f"+{float(entry['sensitivity_pct']) * 100:.0f}%" if entry["sensitivity_pct"] is not None else "Global"
         )
@@ -1235,12 +1410,16 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 "chat_type": row["chat_type"],
                 "records": [],
                 "token_sum": 0,
+                "track_all_users": False,
+                "track_all_token_count": None,
                 "target_count": 0,
                 "target_chat_ids": [],
                 "display_name": row.get("display_name"),
                 "is_enabled": row.get("is_enabled", True),
                 "sensitivity_pct": row.get("sensitivity_pct"),
                 "assigned_userbot_id": row.get("assigned_userbot_id"),
+                "tracking_userbot_id": row.get("tracking_userbot_id"),
+                "tracking_fallback_enabled": row.get("tracking_fallback_enabled", True),
                 "created_at": row.get("created_at"),
                 "template_text": row.get("template_text"),
                 "use_management_bot": bool(row.get("use_management_bot")) if row.get("use_management_bot") is not None else False,
@@ -1255,7 +1434,11 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 "chart_checks_required": row.get("chart_checks_required"),
             })
             entry["records"].append(row)
-            entry["token_sum"] += int(row.get("token_count") or 0)
+            token_count = int(row.get("token_count") or 0)
+            entry["token_sum"] += token_count
+            if row.get("chat_type") == "group" and row.get("user_id") is None:
+                entry["track_all_users"] = True
+                entry["track_all_token_count"] = token_count
 
             if entry["display_name"] is None and row.get("display_name"):
                 entry["display_name"] = row.get("display_name")
@@ -1265,6 +1448,10 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 entry["sensitivity_pct"] = row.get("sensitivity_pct")
             if row.get("assigned_userbot_id") is not None:
                 entry["assigned_userbot_id"] = row.get("assigned_userbot_id")
+            if row.get("tracking_userbot_id") is not None:
+                entry["tracking_userbot_id"] = row.get("tracking_userbot_id")
+            if row.get("tracking_fallback_enabled") is not None:
+                entry["tracking_fallback_enabled"] = bool(row.get("tracking_fallback_enabled"))
             if row.get("created_at"):
                 entry["created_at"] = row.get("created_at")
             if row.get("template_text"):
@@ -1299,6 +1486,10 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 entry["target_chat_ids"] = sorted(existing.union(set(targets)))
                 entry["target_count"] = len(entry["target_chat_ids"])
 
+        for entry in grouped.values():
+            if entry.get("track_all_users") and entry.get("track_all_token_count") is not None:
+                entry["token_sum"] = entry["track_all_token_count"]
+
         return grouped
 
     def _summaries_for_menu(self, grouped: OrderedDict[int, Dict[str, Any]], userbot_lookup: Dict[int, str]) -> List[Dict[str, Any]]:
@@ -1311,6 +1502,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             sensitivity_pct = entry.get("sensitivity_pct")
             is_enabled = entry.get("is_enabled", True)
             use_management_bot = entry.get("use_management_bot", False)
+            track_all_users = entry.get("track_all_users", False)
 
             status_icon = "🟢" if is_enabled else "⛔️"
             name = entry.get("display_name") or f"{entry['chat_type'].upper()} {entry['chat_id']}"
@@ -1319,7 +1511,10 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             if token_sum:
                 meta_parts.append(f"{token_sum} tok")
             if entry["chat_type"] == "group":
-                meta_parts.append(f"{user_count} user" + ("s" if user_count != 1 else ""))
+                if track_all_users:
+                    meta_parts.append("all users")
+                else:
+                    meta_parts.append(f"{user_count} user" + ("s" if user_count != 1 else ""))
             if use_management_bot:
                 meta_parts.append("🛰 mgmt")
             elif userbot_label:
@@ -1344,6 +1539,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
                 "sensitivity_pct": sensitivity_pct,
                 "is_enabled": is_enabled,
                 "use_management_bot": use_management_bot,
+                "track_all_users": track_all_users,
                 "button_text": button_text[:64] if len(button_text) > 64 else button_text,
             })
         return entries
@@ -1353,6 +1549,9 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         grouped: OrderedDict[int, Dict[str, Any]],
         userbot_lookup: Dict[int, str],
         target_lookup: Dict[int, str],
+        page_chat_ids: Optional[List[int]] = None,
+        page: Optional[int] = None,
+        total_pages: Optional[int] = None,
     ) -> str:
         if not grouped:
             return (
@@ -1372,6 +1571,9 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             f"Tracking {total_sources} source(s) across {total_tokens} token baseline(s):",
             "",
         ]
+        if page is not None and total_pages is not None and total_pages > 1:
+            lines.append(f"Page {page}/{total_pages}")
+            lines.append("")
         if disabled_count:
             lines.append(f"⚠️ {disabled_count} source(s) currently disabled.")
             lines.append("")
@@ -1382,7 +1584,15 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             "dm": "💬",
         }
 
-        for info in grouped.values():
+        entries_to_show = []
+        if page_chat_ids:
+            for chat_id in page_chat_ids:
+                if chat_id in grouped:
+                    entries_to_show.append(grouped[chat_id])
+        else:
+            entries_to_show = list(grouped.values())
+
+        for info in entries_to_show:
             chat_id = info["chat_id"]
             chat_type = info["chat_type"]
             is_enabled = info.get("is_enabled", True)
@@ -1422,9 +1632,14 @@ class GainAlertsHandler(ChartAndSettingsMixin):
 
             for record in info["records"]:
                 if chat_type == "group":
-                    lines.append(
-                        f"  • User {record['user_id']} – {record.get('token_count', 0)} token(s)"
-                    )
+                    if record.get("user_id") is None:
+                        lines.append(
+                            f"  • All members – {record.get('token_count', 0)} token(s)"
+                        )
+                    else:
+                        lines.append(
+                            f"  • User {record['user_id']} – {record.get('token_count', 0)} token(s)"
+                        )
                 else:
                     lines.append(
                         f"  • All messages – {record.get('token_count', 0)} token(s)"
@@ -1560,6 +1775,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         self,
         bot: Optional[Bot],
         chat_id: int,
+        page: int = 1,
     ) -> Optional[tuple[str, InlineKeyboardMarkup]]:
         if bot is None:
             return None
@@ -1581,18 +1797,120 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             "",
         ]
 
-        if records:
+        if entry.get("track_all_users"):
+            lines.append("Tracking all members in this group.")
+            page_size = 9
+            page = max(1, page)
+            total_users = await self.db.fetchval(
+                """
+                SELECT COUNT(DISTINCT original_user_id)
+                FROM token_group_alerts
+                WHERE chat_id = $1 AND original_user_id IS NOT NULL
+                """,
+                chat_id,
+            ) or 0
+            total_pages = max(1, (total_users + page_size - 1) // page_size)
+            if page > total_pages:
+                page = total_pages
+            offset = (page - 1) * page_size
+
+            rows = await self.db.fetch(
+                """
+                SELECT
+                    tga.original_user_id AS user_id,
+                    COUNT(*) AS token_count,
+                    (mse.user_id IS NOT NULL) AS is_excluded
+                FROM token_group_alerts tga
+                LEFT JOIN monitored_source_exclusions mse
+                    ON mse.chat_id = tga.chat_id
+                   AND mse.user_id = tga.original_user_id
+                WHERE tga.chat_id = $1 AND tga.original_user_id IS NOT NULL
+                GROUP BY tga.original_user_id, mse.user_id
+                ORDER BY token_count DESC
+                LIMIT $2 OFFSET $3
+                """,
+                chat_id,
+                page_size,
+                offset,
+            )
+
+            excluded_count = await self.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM monitored_source_exclusions
+                WHERE chat_id = $1
+                """,
+                chat_id,
+            ) or 0
+
+            lines.append(f"Excluded users: {excluded_count}")
+            if total_users:
+                start_idx = offset + 1
+                end_idx = min(offset + page_size, total_users)
+                lines.append(f"Showing {start_idx}-{end_idx} of {total_users}")
+
+            if rows:
+                lines.append("")
+                lines.append("Top callers:")
+                page_user_ids = [int(row.get("user_id") or 0) for row in rows]
+                if page_user_ids:
+                    user_map = await self._resolve_user_display_names(bot, chat_id, page_user_ids)
+                for row in rows:
+                    user_id = int(row.get("user_id") or 0)
+                    token_count = int(row.get("token_count") or 0)
+                    display = user_map.get(user_id, str(user_id))
+                    display_safe = html.escape(display)
+                    status_icon = "🚫" if row.get("is_excluded") else "✅"
+                    lines.append(f"• {status_icon} {display_safe} <code>{user_id}</code> – {token_count} token(s)")
+            else:
+                lines.append("No calls recorded yet.")
+        elif records:
             lines.append("Gain alerts will fire when these members post contract addresses:")
             for record in records:
                 user_id = int(record.get("user_id") or 0)
                 token_count = int(record.get("token_count") or 0)
                 display = user_map.get(user_id, str(user_id))
-                lines.append(f"• {display} <code>{user_id}</code> – {token_count} token(s)")
+                display_safe = html.escape(display)
+                lines.append(f"• {display_safe} <code>{user_id}</code> – {token_count} token(s)")
         else:
             lines.append("No specific members are being tracked yet.")
 
         text = "\n".join(lines)
-        keyboard = self.keyboards.tracked_users(records, chat_id)
+        if entry.get("track_all_users"):
+            buttons: List[List[InlineKeyboardButton]] = []
+            row_buffer: List[InlineKeyboardButton] = []
+            for row in rows:
+                user_id = int(row.get("user_id") or 0)
+                display = user_map.get(user_id, str(user_id))
+                label = display if len(display) <= 18 else display[:15] + "..."
+                is_excluded = bool(row.get("is_excluded"))
+                btn_text = f"{'✅ Include' if is_excluded else '🚫 Exclude'} {label}"
+                row_buffer.append(
+                    InlineKeyboardButton(
+                        text=btn_text,
+                        callback_data=f"gain_alerts:view:exclude_user:{chat_id}:{user_id}:page:{page}",
+                    )
+                )
+                if len(row_buffer) == 2:
+                    buttons.append(row_buffer)
+                    row_buffer = []
+
+            if row_buffer:
+                buttons.append(row_buffer)
+
+            if total_pages > 1:
+                nav_row: List[InlineKeyboardButton] = []
+                if page > 1:
+                    nav_row.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"gain_alerts:view:users:{chat_id}:page:{page-1}"))
+                nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="noop"))
+                if page < total_pages:
+                    nav_row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"gain_alerts:view:users:{chat_id}:page:{page+1}"))
+                buttons.append(nav_row)
+
+            buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=f"gain_alerts:view:{chat_id}")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        else:
+            keyboard = self.keyboards.tracked_users(records, chat_id)
         return text, keyboard
 
     def _format_source_detail(
@@ -1706,16 +2024,24 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         if chat_type == "group":
             lines.append("<b>Monitored Users</b>")
             records = entry.get("records", [])
-            if records:
+            if entry.get("track_all_users"):
+                lines.append("• All members (tracking any CA in this group)")
+                lines.append(
+                    f"• Use <code>/stats {entry['chat_id']} user:&lt;id&gt;</code> for individual stats"
+                )
+            elif records:
                 for record in records[:10]:
-                    user_id = int(record.get("user_id") or 0)
+                    user_id = record.get("user_id")
+                    if user_id is None:
+                        continue
                     token_count = int(record.get("token_count") or 0)
                     display = user_display_map.get(user_id) if user_display_map else None
                     if not display:
                         display = str(user_id)
                     lines.append(f"• {display} <code>{user_id}</code> – {token_count} token(s)")
-                if len(records) > 10:
-                    lines.append(f"• …and {len(records) - 10} more")
+                filtered_count = sum(1 for record in records if record.get("user_id") is not None)
+                if filtered_count > 10:
+                    lines.append(f"• …and {filtered_count - 10} more")
             else:
                 lines.append("• None configured yet")
             lines.append("")
@@ -1763,6 +2089,13 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             )
         ])
 
+        rows.append([
+            InlineKeyboardButton(
+                text="📈 Stats",
+                callback_data=f"gain_alerts:view:stats:{chat_id}",
+            )
+        ])
+
         if use_management_bot:
             sender_label = "🛰 Sender: Management Bot"
         elif userbot_label:
@@ -1792,6 +2125,16 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         ])
 
         if chat_type == "group":
+            track_all_users = entry.get("track_all_users", False)
+            toggle_text = "👥 Track All Users: ON" if track_all_users else "👥 Track All Users: OFF"
+            rows.append([
+                InlineKeyboardButton(
+                    text=toggle_text,
+                    callback_data=f"gain_alerts:view:track_all:{chat_id}",
+                )
+            ])
+
+        if chat_type == "group":
             rows.append([
                 InlineKeyboardButton(
                     text="👥 View Tracked Users",
@@ -1807,6 +2150,93 @@ class GainAlertsHandler(ChartAndSettingsMixin):
         ])
 
         rows.append([InlineKeyboardButton(text="🔙 Back", callback_data="gain_alerts:menu")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _format_source_stats(self, display_name: str, stats: Dict[str, Any], timeframe: str) -> str:
+        """Format source statistics as HTML text."""
+        total_calls = stats["total_calls"]
+
+        if total_calls == 0:
+            return (
+                f"📈 <b>Stats for {html.escape(display_name)}</b>\n"
+                f"Period: {timeframe}\n\n"
+                f"No calls recorded in this period."
+            )
+
+        # Format win rates
+        win_rate_2x = stats["win_rate_2x"]
+        win_rate_5x = stats["win_rate_5x"]
+        win_rate_10x = stats["win_rate_10x"]
+        win_rate_100x = stats["win_rate_100x"]
+
+        # Format time to peak
+        avg_time_to_peak = stats["avg_time_to_peak_seconds"]
+        if avg_time_to_peak > 0:
+            hours = int(avg_time_to_peak // 3600)
+            minutes = int((avg_time_to_peak % 3600) // 60)
+            if hours > 0:
+                time_to_peak_str = f"{hours}h {minutes}m"
+            else:
+                time_to_peak_str = f"{minutes}m"
+        else:
+            time_to_peak_str = "N/A"
+
+        # Format multipliers
+        avg_peak_mult = stats["avg_peak_multiplier"]
+        best_mult = stats["best_multiplier"]
+        worst_mult = stats["worst_multiplier"]
+
+        text = (
+            f"📈 <b>Stats for {html.escape(display_name)}</b>\n"
+            f"Period: {timeframe}\n\n"
+            f"📞 <b>Total Calls:</b> {total_calls}\n\n"
+            f"🎯 <b>Win Rates:</b>\n"
+            f"  • 2x: {win_rate_2x:.1f}% ({stats['hits_2x']}/{total_calls})\n"
+            f"  • 5x: {win_rate_5x:.1f}% ({stats['hits_5x']}/{total_calls})\n"
+            f"  • 10x: {win_rate_10x:.1f}% ({stats['hits_10x']}/{total_calls})\n"
+            f"  • 100x: {win_rate_100x:.1f}% ({stats['hits_100x']}/{total_calls})\n\n"
+            f"📊 <b>Performance:</b>\n"
+            f"  • Avg Peak: {avg_peak_mult:.2f}x\n"
+            f"  • Avg Time to Peak: {time_to_peak_str}\n"
+            f"  • Best Call: {best_mult:.2f}x\n"
+            f"  • Worst Call: {worst_mult:.2f}x\n"
+        )
+
+        return text
+
+    def _build_stats_keyboard(self, chat_id: int, current_timeframe: str) -> InlineKeyboardMarkup:
+        """Build keyboard for stats view with timeframe selection."""
+        rows: List[List[InlineKeyboardButton]] = []
+
+        # Timeframe buttons
+        timeframes = [
+            ("1h", "1h"),
+            ("24h", "24h"),
+            ("7d", "7d"),
+            ("30d", "30d"),
+        ]
+
+        timeframe_row = []
+        for label, tf in timeframes:
+            prefix = "✅ " if tf == current_timeframe else ""
+            timeframe_row.append(
+                InlineKeyboardButton(
+                    text=f"{prefix}{label}",
+                    callback_data=f"gain_alerts:view:stats:{chat_id}:{tf}",
+                )
+            )
+
+        rows.append(timeframe_row[:2])  # First 2 buttons
+        rows.append(timeframe_row[2:])  # Last 2 buttons
+
+        # Back button
+        rows.append([
+            InlineKeyboardButton(
+                text="🔙 Back to Source",
+                callback_data=f"gain_alerts:view:detail:{chat_id}",
+            )
+        ])
+
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _build_userbot_menu_keyboard(
@@ -1841,6 +2271,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
 
         start_index = (page - 1) * page_size
         end_index = start_index + page_size
+        row_buffer: List[InlineKeyboardButton] = []
         for record in userbots[start_index:end_index]:
             bot_id = int(record.get("id"))
             label = record.get("label") or f"Userbot {bot_id}"
@@ -1850,12 +2281,18 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             if not use_management_bot and current_bot_id == bot_id:
                 button_text = f"✅ {label}"
 
-            rows.append([
+            row_buffer.append(
                 InlineKeyboardButton(
                     text=button_text,
                     callback_data=f"gain_alerts:view:userbot:set:{chat_id}:{bot_id}",
                 )
-            ])
+            )
+            if len(row_buffer) == 2:
+                rows.append(row_buffer)
+                row_buffer = []
+
+        if row_buffer:
+            rows.append(row_buffer)
 
         if use_management_bot or current_bot_id:
             rows.append([
@@ -1924,6 +2361,7 @@ class GainAlertsHandler(ChartAndSettingsMixin):
 
         start_index = (page - 1) * page_size
         end_index = start_index + page_size
+        row_buffer: List[InlineKeyboardButton] = []
         for record in userbots[start_index:end_index]:
             bot_id = int(record.get("id"))
             label = record.get("label") or f"Userbot {bot_id}"
@@ -1933,12 +2371,18 @@ class GainAlertsHandler(ChartAndSettingsMixin):
             if current_tracking_id == bot_id:
                 button_text = f"✅ {label}"
 
-            rows.append([
+            row_buffer.append(
                 InlineKeyboardButton(
                     text=button_text,
                     callback_data=f"gain_alerts:view:tracking:set:{chat_id}:{bot_id}",
                 )
-            ])
+            )
+            if len(row_buffer) == 2:
+                rows.append(row_buffer)
+                row_buffer = []
+
+        if row_buffer:
+            rows.append(row_buffer)
 
         fallback_icon = "✅" if fallback_enabled else "⛔️"
         rows.append([
