@@ -63,7 +63,7 @@ class UserbotsHandler:
     async def show_userbots_menu(self, query: types.CallbackQuery, page: int = 1) -> None:
         try:
             userbots = await self.get_cached_userbots_with_assignments()
-            page_size = 5
+            page_size = 9
 
             total_pages = (len(userbots) + page_size - 1) // page_size
             start = (page - 1) * page_size

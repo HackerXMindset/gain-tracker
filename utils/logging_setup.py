@@ -14,3 +14,25 @@ def configure_logging(level: Optional[str] = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stdout,
     )
+    _install_default_filters()
+
+
+class _TelethonDebugFilter(logging.Filter):
+    _NOISY_PREFIXES = (
+        "telethon.network",
+        "telethon.extensions",
+        "telethon.client.updates",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno == logging.DEBUG and record.name.startswith(self._NOISY_PREFIXES):
+            return False
+        return True
+
+
+def _install_default_filters() -> None:
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        return
+    for handler in root_logger.handlers:
+        handler.addFilter(_TelethonDebugFilter())

@@ -85,6 +85,12 @@ class TokenModel(BaseModel):
             token_id,
         )
 
+    async def update_peak_reached_at(self, token_id: int) -> None:
+        await self.db.execute(
+            "UPDATE tokens_tracked SET peak_reached_at = NOW() WHERE id = $1",
+            token_id,
+        )
+
     async def update_dex_refresh_time(self, token_id: int) -> None:
         await self.db.execute(
             "UPDATE tokens_tracked SET dex_screener_refreshed_at = NOW() WHERE id = $1",

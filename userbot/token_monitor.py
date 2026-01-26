@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 from config import MAX_VALID_MARKET_CAP, MIN_VALID_MARKET_CAP
 from db import db
 from scheduler.dex_service import get_dex_service
-from services import get_dexscreener_client, get_jupiter_service
+from services import get_dexscreener_client, get_jupiter_service, get_okx_service
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ class TokenMonitor:
     def __init__(self, userbot_id: int) -> None:
         self.userbot_id = userbot_id
         self.dex_client = get_dexscreener_client()
+        self.okx_service = get_okx_service()
 
     async def _fetch_market_snapshot(
         self,
@@ -38,6 +39,11 @@ class TokenMonitor:
                 market_cap = self._normalize_decimal(jupiter_service.get_market_cap(token_data))
                 price = self._normalize_decimal(jupiter_service.get_price(token_data))
                 ticker = jupiter_service.get_ticker(token_data)
+
+            if market_cap is None:
+                okx_data = await self.okx_service.get_token_data(address, chain_id="501", use_cache=False)
+                if okx_data:
+                    market_cap = self._normalize_decimal(self.okx_service.get_market_cap(okx_data))
 
         if market_cap is None:
             normalized_chain = blockchain.strip().upper()

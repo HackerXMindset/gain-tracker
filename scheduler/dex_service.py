@@ -11,8 +11,8 @@ from alerts.dispatcher import GainAlertDispatcher
 from alerts.thresholds import compute_threshold, should_fire_gain_alert
 from charts.chart_fetcher import ChartFetcher
 from db import db
-from models import MonitoredSourceModel, SettingsModel, TokenModel
-from services import get_dexscreener_client, get_jupiter_service
+from models import AnalyticsModel, MonitoredSourceModel, SettingsModel, TokenModel
+from services import get_dexscreener_client, get_jupiter_service, get_okx_service
 from utils.tier_calculator import calculate_next_poll_time, format_duration
 from utils.structured_logging import log_event
 
@@ -31,10 +31,12 @@ def get_dex_service() -> "DexService":
 class DexService:
     def __init__(self) -> None:
         self.token_model = TokenModel()
+        self.analytics_model = AnalyticsModel()
         self.source_model = MonitoredSourceModel(db)
         self.settings_model = SettingsModel(db)
         self.dex_client = get_dexscreener_client()
         self.jupiter_service = get_jupiter_service()
+        self.okx_service = get_okx_service()
         self.dispatcher = GainAlertDispatcher(self.settings_model, self.source_model, self.dex_client)
 
         self.userbot_manager = None
@@ -70,6 +72,7 @@ class DexService:
         self.running = True
         await self.dex_client.start()
         await self.jupiter_service.start()
+        await self.okx_service.start()
         await self._load_tokens_into_scheduler()
         self._scheduler_task = asyncio.create_task(self._run_scheduler())
         logger.info("Dex service started with scheduler")
@@ -88,6 +91,7 @@ class DexService:
 
         await self.dex_client.stop()
         await self.jupiter_service.stop()
+        await self.okx_service.stop()
         logger.info("Dex service stopped")
 
     async def get_service_stats(self) -> Dict[str, Any]:
@@ -156,14 +160,49 @@ class DexService:
 
                 market_cap: Optional[Decimal] = None
                 ticker: Optional[str] = None
+                snapshot_mc: Optional[Decimal] = None
+                snapshot_ticker: Optional[str] = None
+                alert_mc: Optional[Decimal] = None
+                alert_ticker: Optional[str] = None
 
-                if chain_id == "solana":
-                    jup_data = await self.jupiter_service.get_token_data(address, use_cache=False)
-                    if jup_data:
-                        market_cap = self.jupiter_service.get_market_cap(jup_data)
-                        ticker = ticker or self.jupiter_service.get_ticker(jup_data)
+                is_solana = chain_id == "solana"
+                jup_data = None
+                okx_data = None
+                pair_data = None
+                dex_pairs_checked = False
+                dex_no_pools = False
 
-                if market_cap is None:
+                async def _fetch_jupiter_mc() -> Tuple[Optional[Decimal], Optional[str]]:
+                    nonlocal jup_data
+                    if not is_solana:
+                        return None, None
+                    if jup_data is None:
+                        jup_data = await self.jupiter_service.get_token_data(address, use_cache=False)
+                    if not jup_data:
+                        return None, None
+                    return (
+                        self.jupiter_service.get_market_cap(jup_data),
+                        self.jupiter_service.get_ticker(jup_data),
+                    )
+
+                async def _fetch_okx_mc() -> Tuple[Optional[Decimal], Optional[str]]:
+                    nonlocal okx_data
+                    if not is_solana:
+                        return None, None
+                    if okx_data is None:
+                        okx_data = await self.okx_service.get_token_data(address, chain_id="501", use_cache=False)
+                    if not okx_data:
+                        return None, None
+                    return (
+                        self.okx_service.get_market_cap(okx_data),
+                        None,
+                    )
+
+                async def _prepare_dex_pair() -> None:
+                    nonlocal pair_data, dex_pairs_checked, dex_no_pools
+                    if dex_pairs_checked:
+                        return
+                    dex_pairs_checked = True
                     pairs = await self.dex_client.fetch_token_pairs(
                         address,
                         chain_id=chain_id,
@@ -171,16 +210,62 @@ class DexService:
                     )
                     if pairs is None:
                         pair_data = None
-                    elif not pairs:
+                        return
+                    if not pairs:
+                        dex_no_pools = True
+                        return
+                    pair_data = self.dex_client._select_preferred_pair(pairs)
+
+                async def _fetch_dex_mc(stop_on_empty: bool) -> Tuple[Optional[Decimal], Optional[str], bool]:
+                    await _prepare_dex_pair()
+                    if dex_no_pools and stop_on_empty:
+                        return None, None, True
+                    if pair_data:
+                        return (
+                            self.dex_client.get_market_cap(pair_data),
+                            self.dex_client.get_ticker(pair_data),
+                            False,
+                        )
+                    return None, None, False
+
+                # Ongoing monitoring (OKX -> Dex)
+                if is_solana:
+                    market_cap, ticker = await _fetch_okx_mc()
+
+                if market_cap is None:
+                    market_cap, ticker, should_stop = await _fetch_dex_mc(stop_on_empty=True)
+                    if should_stop:
                         logger.info("[POLL] %s has no DexScreener pools; stopping token", address[:8])
                         await self._stop_token(token_id, address, "dex_no_pools")
                         return
-                    else:
-                        pair_data = self.dex_client._select_preferred_pair(pairs)
 
-                    if pair_data:
-                        market_cap = self.dex_client.get_market_cap(pair_data)
-                        ticker = self.dex_client.get_ticker(pair_data)
+                # Timeframe snapshots for /invest (Jupiter -> OKX -> Dex)
+                snapshot_mc, snapshot_ticker = await _fetch_jupiter_mc()
+                if snapshot_mc is None:
+                    snapshot_mc, snapshot_ticker = await _fetch_okx_mc()
+                if snapshot_mc is None:
+                    snapshot_mc, snapshot_ticker, _ = await _fetch_dex_mc(stop_on_empty=False)
+
+                # Pre-alert evaluation (Jupiter -> OKX -> Dex)
+                alert_mc = snapshot_mc
+                alert_ticker = snapshot_ticker
+                if alert_mc is None:
+                    alert_mc, alert_ticker = await _fetch_okx_mc()
+                if alert_mc is None:
+                    alert_mc, alert_ticker, _ = await _fetch_dex_mc(stop_on_empty=False)
+
+                # Record MC history snapshot for investment simulator
+                if snapshot_mc and snapshot_mc > 0:
+                    await self.analytics_model.record_mc_history(token_id, snapshot_mc)
+
+                effective_alert_mc = None
+                effective_alert_ticker = None
+                if alert_mc and alert_mc > 0:
+                    effective_alert_mc = alert_mc
+                    effective_alert_ticker = alert_ticker or ticker
+                elif market_cap and market_cap > 0:
+                    effective_alert_mc = market_cap
+                    effective_alert_ticker = ticker
 
                 if market_cap and market_cap > 0:
                     await self.token_model.update_market_cap(token_id, market_cap, ticker)
@@ -189,14 +274,26 @@ class DexService:
                     peak_mc = token.get("peak_mc") or Decimal(0)
                     if market_cap > peak_mc:
                         await self.token_model.update_peak_mc(token_id, market_cap)
+                        await self.token_model.update_peak_reached_at(token_id)
 
-                    await self._evaluate_gain_alert(token, market_cap, address, ticker)
+                    # Check for milestone achievements
+                    first_seen_mc = token.get("first_seen_mc") or Decimal(0)
+                    first_seen_at = token.get("first_seen_at")
+                    if first_seen_mc > 0 and first_seen_at:
+                        await self._check_and_record_milestones(
+                            token_id, market_cap, first_seen_mc, first_seen_at
+                        )
+
+                    if effective_alert_mc and effective_alert_mc > 0:
+                        await self._evaluate_gain_alert(token, effective_alert_mc, address, effective_alert_ticker)
 
                     should_stop, stop_reason = await self._evaluate_stop_loss(token, market_cap)
                     if should_stop:
                         await self._stop_token(token_id, address, stop_reason or "stop_loss")
                         return
                 else:
+                    if effective_alert_mc and effective_alert_mc > 0:
+                        await self._evaluate_gain_alert(token, effective_alert_mc, address, effective_alert_ticker)
                     logger.debug("[POLL] %s missing market cap", address[:8])
 
                 first_seen_at = token.get("first_seen_at")
@@ -324,6 +421,61 @@ class DexService:
             logger.info("[STOP] Token %s stopped: %s", address[:8], reason)
         except Exception as exc:
             logger.error("Error stopping token %s: %s", address[:8], exc, exc_info=True)
+
+    async def _check_and_record_milestones(
+        self,
+        token_id: int,
+        current_mc: Decimal,
+        first_seen_mc: Decimal,
+        first_seen_at: datetime,
+    ) -> None:
+        """
+        Check if token has hit any new milestones and record them.
+        Only records each milestone once (database UNIQUE constraint enforces this).
+        """
+        try:
+            multiplier = float(current_mc / first_seen_mc)
+
+            # Define milestones in descending order for efficiency
+            milestones = [
+                (100.0, "100x"),
+                (10.0, "10x"),
+                (5.0, "5x"),
+                (2.0, "2x"),
+            ]
+
+            now = datetime.now(timezone.utc)
+            if first_seen_at.tzinfo is None:
+                first_seen_at = first_seen_at.replace(tzinfo=timezone.utc)
+            time_to_milestone = int((now - first_seen_at).total_seconds())
+
+            for threshold, milestone_type in milestones:
+                if multiplier >= threshold:
+                    # Record milestone (will silently skip if already exists due to UNIQUE constraint)
+                    await self.analytics_model.record_milestone(
+                        token_id=token_id,
+                        milestone_type=milestone_type,
+                        achieved_at=now,
+                        market_cap_at_milestone=current_mc,
+                        first_seen_mc=first_seen_mc,
+                        multiplier=Decimal(str(multiplier)),
+                        time_to_milestone_seconds=time_to_milestone,
+                    )
+
+                    logger.debug(
+                        "[MILESTONE] Token %s reached %s (current multiplier: %.2fx)",
+                        token_id,
+                        milestone_type,
+                        multiplier,
+                    )
+
+        except Exception as exc:
+            logger.error(
+                "Error checking milestones for token %s: %s",
+                token_id,
+                exc,
+                exc_info=True,
+            )
 
     async def add_token(self, token_address: str) -> Dict[str, Any]:
         try:

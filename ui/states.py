@@ -31,3 +31,31 @@ class AdminStates(StatesGroup):
     userbot_login_code = State()
     userbot_login_2fa = State()
     userbot_set_name = State()
+
+
+class InvestStates(StatesGroup):
+    selecting_source = State()
+    selecting_user_scope = State()
+    selecting_users = State()
+    selecting_timeframe = State()
+    selecting_hold = State()
+    selecting_allocation = State()
+    entering_custom_tokens = State()
+    entering_custom_hold = State()
+
+
+class ManagementStates(StatesGroup):
+    cmd_fwd_add_rule_source_group = State()
+    cmd_fwd_add_rule_command = State()
+    cmd_fwd_add_rule_monitored_users = State()
+    cmd_fwd_add_rule_forwarding_bot = State()
+    cmd_fwd_add_rule_destination = State()
+    cmd_fwd_add_rule_replying_users = State()
+    cmd_fwd_add_rule_schedule = State()
+    cmd_fwd_add_rule_custom_interval = State()
+    cmd_fwd_add_rule_summary = State()
+    cmd_fwd_add_monitored_user_id = State()
+    cmd_fwd_add_replying_user_id = State()
+    cmd_fwd_edit_command = State()
+    cmd_fwd_schedule_settings = State()
+    cmd_fwd_add_excluded_text = State()

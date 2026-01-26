@@ -12,7 +12,7 @@ from typing import Dict, Optional, Tuple
 from aiogram import types
 from aiogram.fsm.context import FSMContext
 
-from models import ChartRequestGroupModel, SettingsModel
+from models import ChartRequestGroupModel, SettingsModel, AnalyticsModel
 from scheduler import get_dex_service
 from ui.keyboards import Keyboards
 from ui.states import AdminStates
@@ -41,6 +41,7 @@ class SettingsHandler:
         self.keyboards = keyboards
         self.settings_model = SettingsModel(db_pool)
         self.chart_group_model = ChartRequestGroupModel(db_pool)
+        self.analytics_model = AnalyticsModel(db_pool)
 
     def _compose_gain_alert_settings_text(
         self,
@@ -641,7 +642,7 @@ class SettingsHandler:
 
     async def show_tokens_list(self, query: types.CallbackQuery, status: str, page: int = 1) -> None:
         try:
-            items_per_page = 5
+            items_per_page = 9
             offset = (page - 1) * items_per_page
 
             tokens = await self.db.fetch(
@@ -748,3 +749,83 @@ class SettingsHandler:
         if value >= 1_000:
             return f"${value / 1_000:.1f}K"
         return f"${value:.0f}"
+
+    async def cmd_timeframes(self, message: types.Message) -> None:
+        """List all hold timeframes."""
+        try:
+            timeframes = await self.analytics_model.get_hold_timeframes()
+
+            if not timeframes:
+                await message.answer("⏱ <b>No hold timeframes configured.</b>", parse_mode="HTML")
+                return
+
+            lines = ["⏱ <b>Hold Timeframes</b>", ""]
+            
+            defaults = [tf["label"] for tf in timeframes if tf["is_default"]]
+            if defaults:
+                lines.append("<b>Defaults (shown in /invest):</b>")
+                lines.append("✅ " + " | ✅ ".join(defaults))
+                lines.append("")
+
+            lines.append("<b>All available:</b>")
+            lines.append(", ".join([tf["label"] for tf in timeframes]))
+            
+            lines.append("\n<b>Commands:</b>")
+            lines.append("• <code>/addtimeframe &lt;label&gt; &lt;seconds&gt; [default]</code>")
+            lines.append("• <code>/deltimeframe &lt;label&gt;</code>")
+            lines.append("\n<i>Example: /addtimeframe 4h 14400 true</i>")
+
+            await message.answer("\n".join(lines), parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Error in cmd_timeframes: %s", exc)
+            await message.answer("❌ Failed to load timeframes.")
+
+    async def cmd_add_timeframe(self, message: types.Message) -> None:
+        """Add a new hold timeframe."""
+        try:
+            parts = message.text.split()
+            if len(parts) < 3:
+                await message.answer(
+                    "<b>Usage:</b>\n<code>/addtimeframe &lt;label&gt; &lt;seconds&gt; [default]</code>\n\n"
+                    "Example: <code>/addtimeframe 4h 14400 true</code>",
+                    parse_mode="HTML"
+                )
+                return
+
+            label = parts[1]
+            try:
+                seconds = int(parts[2])
+            except ValueError:
+                await message.answer("❌ Seconds must be an integer.")
+                return
+
+            is_default = False
+            if len(parts) > 3:
+                is_default = parts[3].lower() in ("true", "yes", "1")
+
+            success = await self.analytics_model.add_hold_timeframe(label, seconds, is_default)
+            if success:
+                await message.answer(f"✅ Timeframe <b>{label}</b> added ({seconds}s, default: {is_default})", parse_mode="HTML")
+            else:
+                await message.answer(f"❌ Failed to add timeframe <b>{label}</b>. It might already exist.", parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Error in cmd_add_timeframe: %s", exc)
+            await message.answer("❌ Error adding timeframe.")
+
+    async def cmd_del_timeframe(self, message: types.Message) -> None:
+        """Delete a hold timeframe."""
+        try:
+            parts = message.text.split()
+            if len(parts) < 2:
+                await message.answer("<b>Usage:</b>\n<code>/deltimeframe &lt;label&gt;</code>", parse_mode="HTML")
+                return
+
+            label = parts[1]
+            success = await self.analytics_model.delete_hold_timeframe(label)
+            if success:
+                await message.answer(f"✅ Timeframe <b>{label}</b> deleted.", parse_mode="HTML")
+            else:
+                await message.answer(f"❌ Timeframe <b>{label}</b> not found.", parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Error in cmd_del_timeframe: %s", exc)
+            await message.answer("❌ Error deleting timeframe.")

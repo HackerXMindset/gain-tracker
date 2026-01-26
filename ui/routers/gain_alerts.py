@@ -33,6 +33,15 @@ def register(dp: Dispatcher, handler: GainAlertsHandler) -> None:
             await handler.cancel_chart_groups(query, state)
             return
 
+        if len(parts) == 4 and parts[2] == "page":
+            try:
+                page = int(parts[3])
+            except ValueError:
+                await query.answer("❌ Invalid page.", show_alert=True)
+                return
+            await handler.show_chart_groups_menu(query, page=page)
+            return
+
         if len(parts) == 4 and parts[2] == "remove":
             try:
                 chat_id = int(parts[3])
@@ -155,10 +164,40 @@ def register(dp: Dispatcher, handler: GainAlertsHandler) -> None:
         await handler.cancel_chart_settings(query, state, chat_id)
 
     async def show_tracked_users(query) -> None:
-        await handler.show_tracked_users(query, int(query.data.split(":")[-1]))
+        parts = query.data.split(":")
+        chat_id = int(parts[3])
+        page = 1
+        if len(parts) >= 6 and parts[4] == "page":
+            try:
+                page = int(parts[5])
+            except ValueError:
+                page = 1
+        await handler.show_tracked_users(query, chat_id, page=page)
 
     async def remove_user(query) -> None:
         await handler.remove_user(query, int(query.data.split(":")[-1]))
+
+    async def toggle_exclude_user(query) -> None:
+        parts = query.data.split(":")
+        if len(parts) < 5:
+            await query.answer("Invalid selection.", show_alert=True)
+            return
+        try:
+            chat_id = int(parts[3])
+            user_id = int(parts[4])
+        except ValueError:
+            await query.answer("Invalid identifier.", show_alert=True)
+            return
+        page = 1
+        if len(parts) >= 7 and parts[5] == "page":
+            try:
+                page = int(parts[6])
+            except ValueError:
+                page = 1
+        await handler.toggle_user_exclusion(query, chat_id, user_id, page=page)
+
+    async def toggle_track_all(query) -> None:
+        await handler.toggle_track_all_users(query, int(query.data.split(":")[-1]))
 
     async def start_remove_chat(query) -> None:
         await handler.start_remove_chat(query, int(query.data.split(":")[-1]))
@@ -169,7 +208,19 @@ def register(dp: Dispatcher, handler: GainAlertsHandler) -> None:
     async def show_main_menu(query, state) -> None:
         await handler.show_main_menu(query, state)
 
+    async def show_main_menu_page(query, state) -> None:
+        parts = query.data.split(":")
+        if len(parts) < 4:
+            await handler.show_main_menu(query, state)
+            return
+        try:
+            page = int(parts[3])
+        except ValueError:
+            page = 1
+        await handler.show_main_menu(query, state, page=page)
+
     dp.callback_query.register(show_main_menu, F.data == "gain_alerts:menu")
+    dp.callback_query.register(show_main_menu_page, F.data.startswith("gain_alerts:menu:page:"))
     dp.callback_query.register(handler.start_add_flow, F.data == "gain_alerts:add")
     dp.callback_query.register(handle_add_type, F.data.startswith("gain_alerts:add:type:"))
     dp.callback_query.register(handler.confirm_add, F.data == "gain_alerts:add:confirm")
@@ -252,6 +303,13 @@ def register(dp: Dispatcher, handler: GainAlertsHandler) -> None:
     dp.callback_query.register(paginate_tracking, F.data.startswith("gain_alerts:view:tracking:page:"))
     dp.callback_query.register(show_tracking_menu, F.data.regexp(r"^gain_alerts:view:tracking:-?\d+$"))
 
+    async def show_source_stats(query) -> None:
+        parts = query.data.split(":")
+        chat_id = int(parts[3])
+        timeframe = parts[4] if len(parts) > 4 else "24h"
+        await handler.show_source_stats(query, chat_id, timeframe)
+
+    dp.callback_query.register(show_source_stats, F.data.startswith("gain_alerts:view:stats:"))
     dp.callback_query.register(show_chart_settings, F.data.regexp(r"^gain_alerts:view:chart:-?\d+$"))
     dp.callback_query.register(toggle_chart_enabled, F.data.startswith("gain_alerts:view:chart:toggle:"))
     dp.callback_query.register(start_edit_chart_threshold, F.data.startswith("gain_alerts:view:chart:threshold:"))
@@ -261,6 +319,8 @@ def register(dp: Dispatcher, handler: GainAlertsHandler) -> None:
     dp.callback_query.register(cancel_chart_settings, F.data.startswith("gain_alerts:chart_settings:cancel:"))
     dp.callback_query.register(show_tracked_users, F.data.startswith("gain_alerts:view:users:"))
     dp.callback_query.register(remove_user, F.data.startswith("gain_alerts:view:remove_user:"))
+    dp.callback_query.register(toggle_exclude_user, F.data.startswith("gain_alerts:view:exclude_user:"))
+    dp.callback_query.register(toggle_track_all, F.data.startswith("gain_alerts:view:track_all:"))
     dp.callback_query.register(
         start_remove_chat,
         F.data.startswith("gain_alerts:view:remove_chat:") & ~F.data.contains("confirm"),
