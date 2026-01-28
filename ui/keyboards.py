@@ -188,6 +188,17 @@ class Keyboards:
         ])
 
     @staticmethod
+    def autotrader_errors_nav(page: int, total_pages: int) -> InlineKeyboardMarkup:
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"settings:autotrader_errors:page:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton(text="➡️ Next", callback_data=f"settings:autotrader_errors:page:{page+1}"))
+        rows = [buttons] if buttons else []
+        rows.append([InlineKeyboardButton(text="🔙 Back", callback_data="settings:main")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
     def gain_alert_settings_menu(
         gain_threshold: float,
         drop_threshold: float,

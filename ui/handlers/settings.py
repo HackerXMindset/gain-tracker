@@ -388,11 +388,13 @@ class SettingsHandler:
         )
         await message.answer(summary, reply_markup=self.keyboards.settings_menu())
 
-    async def show_autotrader_errors(self, query: types.CallbackQuery) -> None:
+    async def show_autotrader_errors(self, query: types.CallbackQuery, page: int = 1) -> None:
         if not settings.enable_autotrader:
             await query.answer("AutoTrader is disabled.", show_alert=True)
             return
         try:
+            items_per_page = 15
+            offset = (page - 1) * items_per_page
             summary = await self.autotrader_runs.db.fetch(
                 """
                 SELECT COALESCE(event_type,'skip') AS reason, COUNT(*) AS c
@@ -402,14 +404,20 @@ class SettingsHandler:
                 ORDER BY c DESC
                 """
             )
+            total = await self.autotrader_runs.db.fetchval(
+                "SELECT COUNT(*) FROM autotrader_events WHERE event_type='skip'"
+            )
+            total_pages = max(1, (int(total or 0) + items_per_page - 1) // items_per_page)
             details = await self.autotrader_runs.db.fetch(
                 """
                 SELECT event_type, message, created_at
                 FROM autotrader_events
                 WHERE event_type='skip'
                 ORDER BY created_at DESC
-                LIMIT 20
-                """
+                LIMIT $1 OFFSET $2
+                """,
+                items_per_page,
+                offset,
             )
             text = "<b>⚠️ AutoTrader Skips / Errors</b>\n\n"
             if summary:
@@ -423,7 +431,8 @@ class SettingsHandler:
                     text += f"{row['created_at']}: {row['message']}\n"
             else:
                 text += "None\n"
-            await query.message.edit_text(text, reply_markup=self.keyboards.back_to_settings())
+            text += f"\nPage {page}/{total_pages}"
+            await query.message.edit_text(text, reply_markup=self.keyboards.autotrader_errors_nav(page, total_pages))
             await query.answer()
         except Exception as exc:
             logger.error("Error showing autotrader errors: %s", exc, exc_info=True)
