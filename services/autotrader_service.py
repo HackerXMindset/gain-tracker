@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from config import settings
 from models import (
@@ -99,6 +99,8 @@ class AutoTraderService:
         hold_seconds = int(run["hold_seconds"])
         freshness_secs = int(run.get("freshness_secs") or settings.autotrader_freshness_secs)
         max_retries = int(run.get("max_retries") or settings.autotrader_max_retries)
+        breakout_multiple = float(run.get("breakout_multiple") or 10.0)
+        bankrupt_floor = run.get("bankrupt_floor")
 
         open_positions = await self.positions.list_open(run_id)
         open_count = len(open_positions)
@@ -115,6 +117,12 @@ class AutoTraderService:
                     remaining += sell_amount
                     await self.positions.close_position(pos["id"], sell_amount, sell_price, realized, status="sold")
                     await self.events.log(run_id, "sell", f"Sold token {pos['token_id']} for ${sell_amount:,.2f}")
+                    # Breakout / bankruptcy alerts
+                    buy_amt = float(pos["buy_amount"])
+                    if buy_amt > 0 and sell_amount >= buy_amt * breakout_multiple:
+                        await self.events.log(run_id, "alert", f"Breakout {sell_amount/buy_amt:.1f}x for token {pos['token_id']}")
+                    if bankrupt_floor is not None and sell_amount <= float(bankrupt_floor):
+                        await self.events.log(run_id, "alert", f"Bankruptcy threshold hit for token {pos['token_id']}")
                 else:
                     await self.events.log(run_id, "warn", f"Could not fetch fresh price for token {pos['token_id']}")
 
@@ -177,22 +185,15 @@ class AutoTraderService:
             WHERE t.status='active'
         """
         params = []
-        if mode == "single" and channels:
+        if mode in {"single", "multi"} and channels:
             base_query += " AND t.first_seen_source = ANY($1)"
             params.append(channels)
-        elif mode == "multi" and channels:
-            base_query += " AND t.first_seen_source = ANY($1)"
-            params.append(channels)
-        # mode == all -> no filter
-
-        base_query += " ORDER BY t.first_seen_at DESC LIMIT $2"
-
-        if not params:
-            params = [limit]
-            return await self.token_model.db.fetch(base_query, limit)
-        else:
+            base_query += " ORDER BY t.first_seen_at DESC LIMIT $2"
             params.append(limit)
             return await self.token_model.db.fetch(base_query, *params)
+        else:
+            base_query += " ORDER BY t.first_seen_at DESC LIMIT $1"
+            return await self.token_model.db.fetch(base_query, limit)
 
     async def _attempt_buy(self, run_id: int, token: dict, spend: float, max_retries: int, freshness_secs: int) -> bool:
         token_id = token["id"]
@@ -207,9 +208,12 @@ class AutoTraderService:
         if liq is None or mc is None or (liq is not None and mc is not None and liq < (mc * Decimal("0.10"))):
             await self.events.log(run_id, "skip", f"Low liquidity for {address[:8]}")
             return False
-        qty = spend / price
-        await self.positions.create_position(run_id, token_id, spend, price, mc, qty)
-        await self.events.log(run_id, "buy", f"Bought {address[:8]} spend ${spend:,.2f} @ ${price:.8f}")
+        eff_price, eff_qty, fees = self._apply_fees_and_slippage(spend, price, liq)
+        if eff_qty <= 0:
+            await self.events.log(run_id, "skip", f"Fees/slippage zeroed qty for {address[:8]}")
+            return False
+        await self.positions.create_position(run_id, token_id, spend, eff_price, mc, eff_qty)
+        await self.events.log(run_id, "buy", f"Bought {address[:8]} spend ${spend:,.2f} @ ${eff_price:.8f} (qty {eff_qty:.6f}, fees {fees})")
         return True
 
     async def _fetch_fresh_price(self, address: str, max_retries: int, freshness_secs: int):
@@ -234,6 +238,33 @@ class AutoTraderService:
                     return price, mc
             await asyncio.sleep(0.5)
         return last_data if last_data else (None, None)
+
+    def _apply_fees_and_slippage(self, spend: float, price: Decimal, liquidity: Optional[Decimal]) -> Tuple[Decimal, Decimal, str]:
+        """
+        Approximate /invest model:
+        - Slippage proportional to trade size vs liquidity (cap 5%)
+        - Trojan fee 1% of notional
+        - Gas cost fixed $0.70 (0.0035 SOL @ $200)
+        """
+        liq = liquidity or Decimal("0")
+        spend_dec = Decimal(str(spend))
+        slippage_pct = Decimal("0")
+        if liq > 0:
+            try:
+                slippage_pct = min(Decimal("0.05"), spend_dec / liq)
+            except (InvalidOperation, ZeroDivisionError):
+                slippage_pct = Decimal("0.05")
+        fee_pct = Decimal("0.01")
+        gas_cost = Decimal("0.70")
+
+        fee_cost = spend_dec * fee_pct
+        net_after_fees = spend_dec - fee_cost - gas_cost
+        if net_after_fees <= 0:
+            return price, Decimal("0"), f"fee={fee_cost:.4f},gas={gas_cost:.4f},slip={slippage_pct:.4f}"
+
+        effective_price = price * (Decimal("1") + slippage_pct)
+        qty = net_after_fees / effective_price if effective_price > 0 else Decimal("0")
+        return effective_price, qty, f"fee={fee_cost:.4f},gas={gas_cost:.4f},slip={slippage_pct:.4f}"
 
     async def _fetch_sell_value(self, pos: dict, max_retries: int, freshness_secs: int):
         token_id = pos["token_id"]
