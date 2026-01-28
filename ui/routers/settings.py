@@ -7,7 +7,7 @@ from aiogram.filters import StateFilter
 
 from config import settings
 from ui.handlers.settings import SettingsHandler
-from ui.states import AdminStates
+from ui.states import AdminStates, AutoTraderStates
 
 
 def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
@@ -120,6 +120,43 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
     dispatcher.callback_query.register(
         handler.show_autotrader_entry,
         F.data.startswith("settings:autotrader"),
+        admin_filter,
+    )
+
+    # AutoTrader FSM (simple linear wizard)
+    dispatcher.message.register(
+        handler.autotrader_get_budget,
+        StateFilter(AutoTraderStates.awaiting_budget),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_per_coin,
+        StateFilter(AutoTraderStates.awaiting_per_coin),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_hold,
+        StateFilter(AutoTraderStates.awaiting_hold),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_coin_cap,
+        StateFilter(AutoTraderStates.awaiting_coin_cap),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_channel_mode,
+        StateFilter(AutoTraderStates.awaiting_channel_mode),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_channels,
+        StateFilter(AutoTraderStates.awaiting_channels),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_report_interval,
+        StateFilter(AutoTraderStates.awaiting_report_interval),
         admin_filter,
     )
 

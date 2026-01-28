@@ -12,11 +12,17 @@ from typing import Dict, Optional, Tuple
 from aiogram import types
 from aiogram.fsm.context import FSMContext
 
-from models import ChartRequestGroupModel, SettingsModel, AnalyticsModel, ApiMetricsModel
+from models import (
+    ChartRequestGroupModel,
+    SettingsModel,
+    AnalyticsModel,
+    ApiMetricsModel,
+    AutoTraderRunModel,
+)
 from config import settings
 from scheduler import get_dex_service
 from ui.keyboards import Keyboards
-from ui.states import AdminStates
+from ui.states import AdminStates, AutoTraderStates
 from alerts.templates import (
     DEFAULT_GAIN_ALERT_TEMPLATE,
     normalise_template,
@@ -43,6 +49,7 @@ class SettingsHandler:
         self.settings_model = SettingsModel(db_pool)
         self.chart_group_model = ChartRequestGroupModel(db_pool)
         self.analytics_model = AnalyticsModel(db_pool)
+        self.autotrader_runs = AutoTraderRunModel(db_pool)
 
     def _compose_gain_alert_settings_text(
         self,
@@ -195,6 +202,149 @@ class SettingsHandler:
             logger.error("Error showing settings menu: %s", exc)
             await query.answer("❌ Error loading settings", show_alert=True)
 
+    async def show_autotrader_entry(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        if not settings.enable_autotrader:
+            await query.answer("AutoTrader is disabled. Set ENABLE_AUTOTRADER=true to enable.", show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await query.message.edit_text(
+            "<b>🤖 AutoTrader</b>\n"
+            "Live invest with fresh data (≤15s). We’ll ask a few fields.\n\n"
+            "Enter total budget (USD):",
+        )
+        await query.answer()
+
+    async def autotrader_get_budget(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            budget = float(message.text.replace(",", ""))
+            if budget <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for budget (e.g., 10000).")
+            return
+        await state.update_data(budget_total=budget, remaining_cash=budget)
+        await state.set_state(AutoTraderStates.awaiting_per_coin)
+        await message.answer("Per-coin spend (USD):")
+
+    async def autotrader_get_per_coin(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            per_coin = float(message.text.replace(",", ""))
+            if per_coin <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for per-coin spend.")
+            return
+        await state.update_data(per_coin_spend=per_coin)
+        await state.set_state(AutoTraderStates.awaiting_hold)
+        await message.answer("Hold time in minutes (e.g., 60):")
+
+    async def autotrader_get_hold(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            hold_min = int(message.text.strip())
+            if hold_min <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter hold time in minutes (positive integer).")
+            return
+        await state.update_data(hold_seconds=hold_min * 60)
+        await state.set_state(AutoTraderStates.awaiting_coin_cap)
+        await message.answer("Coin cap (how many coins to trade this run). Send a number or 'skip' for default 100:")
+
+    async def autotrader_get_coin_cap(self, message: types.Message, state: FSMContext) -> None:
+        text = message.text.strip().lower()
+        if text == "skip":
+            cap = settings.autotrader_default_coin_cap
+        else:
+            try:
+                cap = int(text)
+                if cap <= 0:
+                    raise ValueError
+            except Exception:
+                await message.answer("Enter a positive integer or 'skip'.")
+                return
+        await state.update_data(coin_cap=cap)
+        await state.set_state(AutoTraderStates.awaiting_channel_mode)
+        await message.answer("Channel mode: 'single', 'multi', or 'all':")
+
+    async def autotrader_get_channel_mode(self, message: types.Message, state: FSMContext) -> None:
+        mode = message.text.strip().lower()
+        if mode not in {"single", "multi", "all"}:
+            await message.answer("Choose: single | multi | all")
+            return
+        await state.update_data(channel_mode=mode)
+        await state.set_state(AutoTraderStates.awaiting_channels)
+        await message.answer("Provide channel IDs/usernames (comma separated) or 'all':")
+
+    async def autotrader_get_channels(self, message: types.Message, state: FSMContext) -> None:
+        txt = message.text.strip()
+        channels = []
+        if txt.lower() != "all":
+            channels = [p.strip() for p in txt.split(",") if p.strip()]
+            if not channels:
+                await message.answer("Provide at least one channel or type 'all'.")
+                return
+        await state.update_data(channels=channels)
+        await state.set_state(AutoTraderStates.awaiting_report_interval)
+        await message.answer("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:")
+
+    async def autotrader_get_report_interval(self, message: types.Message, state: FSMContext) -> None:
+        txt = message.text.strip().lower()
+        interval = None
+        if txt != "skip":
+            try:
+                minutes = int(txt)
+                if minutes <= 0:
+                    raise ValueError
+                interval = minutes * 60
+            except Exception:
+                await message.answer("Enter minutes as a positive integer or 'skip'.")
+                return
+
+        data = await state.get_data()
+        budget_total = data["budget_total"]
+        per_coin = data["per_coin_spend"]
+        hold_seconds = data["hold_seconds"]
+        coin_cap = data["coin_cap"]
+        channel_mode = data["channel_mode"]
+        channels = data.get("channels", [])
+
+        # Create run
+        run_id = await self.autotrader_runs.create_run(
+            {
+                "name": f"AutoTrader {channel_mode}",
+                "created_by_user_id": message.from_user.id,
+                "destination_chat_id": message.chat.id,
+                "destination_type": "chat",
+                "status": "pending",
+                "start_at": None,
+                "stop_at": None,
+                "budget_total": budget_total,
+                "per_coin_spend": per_coin,
+                "remaining_cash": budget_total,
+                "coin_cap": coin_cap,
+                "hold_seconds": hold_seconds,
+                "report_interval_seconds": interval,
+                "breakout_multiple": None,
+                "bankrupt_floor": None,
+                "target_value": None,
+                "channel_mode": channel_mode,
+                "channels": channels if channels else None,
+                "freshness_secs": settings.autotrader_freshness_secs,
+                "max_retries": settings.autotrader_max_retries,
+            }
+        )
+
+        await state.clear()
+        summary = (
+            f"✅ AutoTrader run created (ID {run_id})\n"
+            f"Budget: ${budget_total:,.2f} | Per-coin: ${per_coin:,.2f}\n"
+            f"Hold: {hold_seconds//60} min | Coin cap: {coin_cap}\n"
+            f"Channels: {'all' if not channels else ', '.join(channels)} (mode: {channel_mode})\n"
+            f"Report interval: {'off' if interval is None else str(interval//60)+' min'}\n"
+            "Status: pending (engine wiring next)."
+        )
+        await message.answer(summary, reply_markup=self.keyboards.settings_menu())
     async def show_autotrader_entry(self, query: types.CallbackQuery) -> None:
         if not settings.enable_autotrader:
             await query.answer("AutoTrader is disabled. Set ENABLE_AUTOTRADER=true to enable.", show_alert=True)

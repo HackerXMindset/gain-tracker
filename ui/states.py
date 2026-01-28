@@ -44,6 +44,15 @@ class InvestStates(StatesGroup):
     entering_custom_hold = State()
 
 
+class AutoTraderStates(StatesGroup):
+    awaiting_budget = State()
+    awaiting_per_coin = State()
+    awaiting_hold = State()
+    awaiting_coin_cap = State()
+    awaiting_channel_mode = State()
+    awaiting_channels = State()
+    awaiting_report_interval = State()
+
 class ManagementStates(StatesGroup):
     cmd_fwd_add_rule_source_group = State()
     cmd_fwd_add_rule_command = State()
