@@ -47,7 +47,9 @@ class InvestStates(StatesGroup):
 class AutoTraderStates(StatesGroup):
     awaiting_destination = State()
     awaiting_budget = State()
+    awaiting_custom_budget = State()
     awaiting_per_coin = State()
+    awaiting_custom_per_coin = State()
     awaiting_hold = State()
     awaiting_coin_cap = State()
     awaiting_custom_coin_cap = State()

@@ -159,6 +159,16 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
         StateFilter(AutoTraderStates.awaiting_destination),
         admin_filter,
     )
+    dispatcher.callback_query.register(
+        handler.autotrader_budget_button,
+        F.data.startswith("autotrader:budget:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_per_coin_button,
+        F.data.startswith("autotrader:per:"),
+        admin_filter,
+    )
     dispatcher.message.register(
         handler.autotrader_get_budget,
         StateFilter(AutoTraderStates.awaiting_budget),

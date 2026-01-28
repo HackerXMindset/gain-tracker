@@ -200,6 +200,30 @@ class Keyboards:
         ])
 
     @staticmethod
+    def autotrader_budget() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="$1k", callback_data="autotrader:budget:1000"),
+                InlineKeyboardButton(text="$10k", callback_data="autotrader:budget:10000"),
+                InlineKeyboardButton(text="$100k", callback_data="autotrader:budget:100000"),
+            ],
+            [InlineKeyboardButton(text="$1M", callback_data="autotrader:budget:1000000")],
+            [InlineKeyboardButton(text="🔢 Custom", callback_data="autotrader:budget:custom")],
+        ])
+
+    @staticmethod
+    def autotrader_per_coin() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="$10", callback_data="autotrader:per:10"),
+                InlineKeyboardButton(text="$50", callback_data="autotrader:per:50"),
+                InlineKeyboardButton(text="$100", callback_data="autotrader:per:100"),
+            ],
+            [InlineKeyboardButton(text="$250", callback_data="autotrader:per:250")],
+            [InlineKeyboardButton(text="🔢 Custom", callback_data="autotrader:per:custom")],
+        ])
+
+    @staticmethod
     def autotrader_coin_cap() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
             [

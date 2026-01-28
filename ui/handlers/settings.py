@@ -252,7 +252,7 @@ class SettingsHandler:
                 return
         await state.update_data(destination_chat_id=dest_chat_id, destination_type=dest_type)
         await state.set_state(AutoTraderStates.awaiting_budget)
-        await message.answer("Enter total budget (USD):")
+        await message.answer("Enter total budget (USD):", reply_markup=self.keyboards.autotrader_budget())
 
     async def autotrader_dest_here(self, query: types.CallbackQuery, state: FSMContext) -> None:
         await state.update_data(destination_chat_id=query.message.chat.id, destination_type="chat")
@@ -281,7 +281,30 @@ class SettingsHandler:
             return
         await state.update_data(budget_total=budget, remaining_cash=budget)
         await state.set_state(AutoTraderStates.awaiting_per_coin)
-        await message.answer("Per-coin spend (USD):")
+        await message.answer("Per-coin spend (USD):", reply_markup=self.keyboards.autotrader_per_coin())
+
+    async def autotrader_budget_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_budget)
+            await query.message.edit_text("Enter total budget (USD):")
+        else:
+            await state.update_data(budget_total=float(val), remaining_cash=float(val))
+            await state.set_state(AutoTraderStates.awaiting_per_coin)
+            await query.message.edit_text("Per-coin spend (USD):", reply_markup=self.keyboards.autotrader_per_coin())
+        await query.answer()
+
+    async def autotrader_per_coin_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_per_coin)
+            await query.message.edit_text("Enter per-coin spend (USD):")
+        else:
+            spend = float(val)
+            await state.update_data(per_coin_spend=spend)
+            await state.set_state(AutoTraderStates.awaiting_hold)
+            await query.message.edit_text("Hold time in minutes (e.g., 60):")
+        await query.answer()
 
     async def autotrader_get_per_coin(self, message: types.Message, state: FSMContext) -> None:
         try:
