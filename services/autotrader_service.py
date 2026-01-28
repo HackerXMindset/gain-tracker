@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
 from config import settings
@@ -74,9 +74,7 @@ class AutoTraderService:
                 await asyncio.sleep(5)
 
     async def _process_pending(self) -> None:
-        rows = await self.runs.db.fetch(
-            "SELECT * FROM autotrader_runs WHERE status='pending' ORDER BY created_at ASC LIMIT 5"
-        )
+        rows = await self.runs.list_pending(limit=5)
         for row in rows:
             run_id = row["id"]
             await self.runs.update_status(run_id, "running")
@@ -89,6 +87,7 @@ class AutoTraderService:
         for row in rows:
             run_id = row["id"]
             try:
+                await self._maybe_enqueue_report(row)
                 await self._process_run(row)
             except Exception as exc:
                 logger.error("[AUTOTRADER] Run %s error: %s", run_id, exc, exc_info=True)
@@ -105,6 +104,7 @@ class AutoTraderService:
         max_retries = int(run.get("max_retries") or settings.autotrader_max_retries)
         breakout_multiple = float(run.get("breakout_multiple") or 10.0)
         bankrupt_floor = run.get("bankrupt_floor")
+        dest_chat = run.get("destination_chat_id")
 
         open_positions = await self.positions.list_open(run_id)
         open_count = len(open_positions)
@@ -124,9 +124,13 @@ class AutoTraderService:
                     # Breakout / bankruptcy alerts
                     buy_amt = float(pos["buy_amount"])
                     if buy_amt > 0 and sell_amount >= buy_amt * breakout_multiple:
-                        await self.events.log(run_id, "alert", f"Breakout {sell_amount/buy_amt:.1f}x for token {pos['token_id']}")
+                        msg = f"🚀 Breakout {sell_amount/buy_amt:.1f}x on token {pos['token_id']}"
+                        await self.events.log(run_id, "alert", msg)
+                        await self._notify(dest_chat, msg)
                     if bankrupt_floor is not None and sell_amount <= float(bankrupt_floor):
-                        await self.events.log(run_id, "alert", f"Bankruptcy threshold hit for token {pos['token_id']}")
+                        msg = f"💀 Bankruptcy threshold hit for token {pos['token_id']}"
+                        await self.events.log(run_id, "alert", msg)
+                        await self._notify(dest_chat, msg)
                 else:
                     await self.events.log(run_id, "warn", f"Could not fetch fresh price for token {pos['token_id']}")
 
@@ -210,6 +214,13 @@ class AutoTraderService:
             lines.append(f"... +{len(events)-100} more")
         return "\n".join(lines)
 
+    async def _notify(self, chat_id: Optional[int], text: str) -> None:
+        if chat_id and self.management_bot:
+            try:
+                await self.management_bot.send_message(chat_id, text)
+            except Exception as exc:
+                logger.error("[AUTOTRADER] Notify failed %s: %s", chat_id, exc)
+
     async def _meets_stop_rules(self, run: dict, remaining: float) -> bool:
         target_value = run.get("target_value")
         bankrupt_floor = run.get("bankrupt_floor")
@@ -222,6 +233,24 @@ class AutoTraderService:
         if target_value is not None and remaining >= float(target_value):
             return True
         return False
+
+    async def _maybe_enqueue_report(self, run: dict) -> None:
+        interval = run.get("report_interval_seconds")
+        if not interval:
+            return
+        latest = await self.reports.db.fetchrow(
+            "SELECT period_end FROM autotrader_reports WHERE run_id=$1 ORDER BY period_end DESC LIMIT 1",
+            run["id"],
+        )
+        now = datetime.now(timezone.utc)
+        last_end = latest["period_end"] if latest else run.get("created_at", now - timedelta(seconds=interval))
+        if (now - last_end).total_seconds() >= interval:
+            await self.reports.enqueue_report(
+                run_id=run["id"],
+                period_start=last_end,
+                period_end=now,
+                delivered_to=run.get("destination_chat_id"),
+            )
 
     async def _pick_fresh_tokens(self, run: dict, limit: int):
         mode = run.get("channel_mode", "single")
