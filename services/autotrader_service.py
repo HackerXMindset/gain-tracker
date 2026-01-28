@@ -202,10 +202,16 @@ class AutoTraderService:
         }
 
     def _render_report(self, run: dict, rpt: dict, summary: dict, events) -> str:
+        budget = run.get("budget_total")
+        remaining = run.get("remaining_cash")
+        per_coin = run.get("per_coin_spend")
+        coin_cap = run.get("coin_cap")
+        hold_min = (run.get("hold_seconds") or 0) // 60
         lines = [
             f"AutoTrader Report (Run {rpt['run_id']})",
             f"Period: {rpt['period_start']} → {rpt['period_end']}",
             f"Buys: {summary['buys']} | Sells: {summary['sells']} | Skips: {summary['skips']} | Alerts: {summary['alerts']}",
+            f"Budget: {budget} | Remaining: {remaining} | Per-coin: {per_coin} | Cap: {coin_cap} | Hold: {hold_min}m",
             "",
         ]
         for e in events[:100]:
@@ -322,7 +328,7 @@ class AutoTraderService:
         Approximate /invest model:
         - Slippage proportional to trade size vs liquidity (cap 5%)
         - Trojan fee 1% of notional
-        - Gas cost fixed $0.70 (0.0035 SOL @ $200)
+        - Gas cost fixed $1.40 (per /invest defaults)
         """
         liq = liquidity or Decimal("0")
         spend_dec = Decimal(str(spend))
@@ -333,7 +339,7 @@ class AutoTraderService:
             except (InvalidOperation, ZeroDivisionError):
                 slippage_pct = Decimal("0.05")
         fee_pct = Decimal("0.01")
-        gas_cost = Decimal("0.70")
+        gas_cost = Decimal("1.40")
 
         fee_cost = spend_dec * fee_pct
         net_after_fees = spend_dec - fee_cost - gas_cost

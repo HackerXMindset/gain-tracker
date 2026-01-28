@@ -894,6 +894,10 @@ class SettingsHandler:
                 """
             )
 
+            autotrader_skips_24h = await self.db.fetchval(
+                "SELECT COUNT(*) FROM autotrader_events WHERE event_type='skip' AND created_at >= NOW() - interval '24 hours'"
+            )
+
             missing_reason_rows = await self.db.fetch(
                 """
                 SELECT COALESCE(last_error_message, status) AS reason, COUNT(*) AS count
@@ -1000,6 +1004,7 @@ class SettingsHandler:
                 f"  ├ Jupiter: {j_checks_d} checks, {j_err_d} errors\n"
                 f"  ├ DexPaprika: {d_checks_d} checks, {d_err_d} errors\n"
                 f"  └ DexScreener: {x_checks_d} checks, {x_err_d} errors\n\n"
+                f"<b>🤖 AutoTrader Skips (24h):</b> {autotrader_skips_24h or 0}\n\n"
                 "<b>🧩 Missing Reasons</b>\n"
             )
 
