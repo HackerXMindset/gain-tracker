@@ -121,6 +121,12 @@ class AutoTraderService:
         # Update cash after sells
         await self.runs.update_remaining_cash(run_id, remaining)
 
+        # Stop rules
+        if await self._meets_stop_rules(run, remaining):
+            await self.runs.update_status(run_id, "completed")
+            await self.events.log(run_id, "info", "Run stopped by stop rule")
+            return
+
         # Check coin cap
         if open_count >= coin_cap:
             await self.events.log(run_id, "info", f"Coin cap reached ({open_count}/{coin_cap})")
@@ -147,6 +153,19 @@ class AutoTraderService:
         if not open_positions and remaining < per_coin:
             await self.runs.update_status(run_id, "completed")
             await self.events.log(run_id, "info", "Run completed (cash exhausted or cap reached)")
+
+    async def _meets_stop_rules(self, run: dict, remaining: float) -> bool:
+        target_value = run.get("target_value")
+        bankrupt_floor = run.get("bankrupt_floor")
+        stop_at = run.get("stop_at")
+        now = datetime.now(timezone.utc)
+        if stop_at and stop_at <= now:
+            return True
+        if bankrupt_floor is not None and remaining <= float(bankrupt_floor):
+            return True
+        if target_value is not None and remaining >= float(target_value):
+            return True
+        return False
 
     async def _pick_fresh_tokens(self, run: dict, limit: int):
         mode = run.get("channel_mode", "single")
