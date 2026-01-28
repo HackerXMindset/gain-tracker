@@ -45,11 +45,14 @@ async def run() -> None:
     management_bot = None
     admin_bot_task: Optional[asyncio.Task] = None
     snapshot_scheduler: Optional[SnapshotScheduler] = None
+    autotrader_service = None
 
     services_started = {
         "stats": False,
         "cmd_fwd": False,
         "dex": False,
+        "snapshot": False,
+        "autotrader": False,
     }
 
     try:
@@ -82,6 +85,12 @@ async def run() -> None:
             await snapshot_scheduler.start()
             services_started["snapshot"] = True
 
+        if settings.enable_autotrader:
+            from services.autotrader_service import AutoTraderService
+            autotrader_service = AutoTraderService()
+            await autotrader_service.start()
+            services_started["autotrader"] = True
+
         # Start admin bot in the same process (for /tri chart support)
         if settings.mgmt_bot_token:
             from admin_bot import create_admin_dispatcher
@@ -102,6 +111,8 @@ async def run() -> None:
                 await admin_bot_task
         if services_started.get("snapshot") and snapshot_scheduler:
             await snapshot_scheduler.stop()
+        if services_started.get("autotrader") and autotrader_service:
+            await autotrader_service.stop()
         if services_started["dex"] and dex_service:
             await dex_service.stop()
         if services_started["cmd_fwd"] and cmd_fwd_service:
