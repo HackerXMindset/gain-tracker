@@ -50,9 +50,11 @@ class AutoTraderStates(StatesGroup):
     awaiting_per_coin = State()
     awaiting_hold = State()
     awaiting_coin_cap = State()
+    awaiting_custom_coin_cap = State()
     awaiting_channel_mode = State()
     awaiting_channels = State()
     awaiting_report_interval = State()
+    awaiting_custom_interval = State()
 
 class ManagementStates(StatesGroup):
     cmd_fwd_add_rule_source_group = State()

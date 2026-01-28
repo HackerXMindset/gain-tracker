@@ -230,7 +230,7 @@ class SettingsHandler:
             "- Send 'dm' to use your DM\n"
             "- Or send a chat ID\n"
         )
-        await query.message.edit_text(text)
+        await query.message.edit_text(text, reply_markup=self.keyboards.autotrader_destinations())
         await query.answer()
 
     async def autotrader_get_destination(self, message: types.Message, state: FSMContext) -> None:
@@ -288,7 +288,7 @@ class SettingsHandler:
             return
         await state.update_data(hold_seconds=hold_min * 60)
         await state.set_state(AutoTraderStates.awaiting_coin_cap)
-        await message.answer("Coin cap (how many coins to trade this run). Send a number or 'skip' for default 100:")
+        await message.answer("Coin cap (how many coins to trade this run):", reply_markup=self.keyboards.autotrader_coin_cap())
 
     async def autotrader_get_coin_cap(self, message: types.Message, state: FSMContext) -> None:
         text = message.text.strip().lower()
@@ -304,7 +304,7 @@ class SettingsHandler:
                 return
         await state.update_data(coin_cap=cap)
         await state.set_state(AutoTraderStates.awaiting_channel_mode)
-        await message.answer("Channel mode: 'single', 'multi', or 'all':")
+        await message.answer("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
 
     async def autotrader_get_channel_mode(self, message: types.Message, state: FSMContext) -> None:
         mode = message.text.strip().lower()
@@ -313,7 +313,7 @@ class SettingsHandler:
             return
         await state.update_data(channel_mode=mode)
         await state.set_state(AutoTraderStates.awaiting_channels)
-        await message.answer("Provide channel IDs/usernames (comma separated) or 'all':")
+        await self._prompt_channels(message, mode)
 
     async def autotrader_get_channels(self, message: types.Message, state: FSMContext) -> None:
         txt = message.text.strip()
@@ -325,7 +325,7 @@ class SettingsHandler:
                 return
         await state.update_data(channels=channels)
         await state.set_state(AutoTraderStates.awaiting_report_interval)
-        await message.answer("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:")
+        await message.answer("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:", reply_markup=self.keyboards.autotrader_interval())
 
     async def autotrader_get_report_interval(self, message: types.Message, state: FSMContext) -> None:
         txt = message.text.strip().lower()
@@ -387,6 +387,21 @@ class SettingsHandler:
             "Status: pending (engine wiring next)."
         )
         await message.answer(summary, reply_markup=self.keyboards.settings_menu())
+
+    async def _prompt_channels(self, message: types.Message, mode: str) -> None:
+        try:
+            sources = await self.source_model.get_all()
+            options = []
+            for src in sources[:10]:
+                label = f"{src.get('chat_id')} ({src.get('chat_type')})"
+                cb = f"autotrader:channels:{src.get('chat_id')}"
+                options.append((label, cb))
+            await message.answer(
+                "Select channel(s) or choose All/Custom:",
+                reply_markup=self.keyboards.autotrader_channels_list(options),
+            )
+        except Exception:
+            await message.answer("Provide channel IDs/usernames (comma separated) or 'all':")
 
     async def show_autotrader_errors(self, query: types.CallbackQuery, page: int = 1) -> None:
         if not settings.enable_autotrader:

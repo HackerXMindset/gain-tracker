@@ -189,6 +189,59 @@ class Keyboards:
         ])
 
     @staticmethod
+    def autotrader_destinations() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📨 Send Here", callback_data="autotrader:dest:here"),
+                InlineKeyboardButton(text="🙋‍♂️ DM Me", callback_data="autotrader:dest:dm"),
+            ],
+            [InlineKeyboardButton(text="🔢 Custom Chat ID", callback_data="autotrader:dest:custom")],
+            [InlineKeyboardButton(text="🔙 Cancel", callback_data="settings:main")],
+        ])
+
+    @staticmethod
+    def autotrader_coin_cap() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="50", callback_data="autotrader:cap:50"),
+                InlineKeyboardButton(text="100", callback_data="autotrader:cap:100"),
+                InlineKeyboardButton(text="200", callback_data="autotrader:cap:200"),
+            ],
+            [InlineKeyboardButton(text="🔢 Custom", callback_data="autotrader:cap:custom")],
+            [InlineKeyboardButton(text="⏭️ Skip (use default 100)", callback_data="autotrader:cap:skip")],
+        ])
+
+    @staticmethod
+    def autotrader_channel_mode() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Single", callback_data="autotrader:mode:single"),
+                InlineKeyboardButton(text="Multi", callback_data="autotrader:mode:multi"),
+                InlineKeyboardButton(text="All", callback_data="autotrader:mode:all"),
+            ],
+        ])
+
+    @staticmethod
+    def autotrader_interval() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="60 min", callback_data="autotrader:interval:60"),
+                InlineKeyboardButton(text="240 min", callback_data="autotrader:interval:240"),
+            ],
+            [InlineKeyboardButton(text="🔢 Custom", callback_data="autotrader:interval:custom")],
+            [InlineKeyboardButton(text="⏭️ Skip", callback_data="autotrader:interval:skip")],
+        ])
+
+    @staticmethod
+    def autotrader_channels_list(options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+        buttons = []
+        for label, cb in options:
+            buttons.append([InlineKeyboardButton(text=label, callback_data=cb)])
+        buttons.append([InlineKeyboardButton(text="All Sources", callback_data="autotrader:channels:all")])
+        buttons.append([InlineKeyboardButton(text="🔢 Custom", callback_data="autotrader:channels:custom")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
     def autotrader_errors_nav(page: int, total_pages: int) -> InlineKeyboardMarkup:
         buttons = []
         if page > 1:
