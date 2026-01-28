@@ -254,6 +254,23 @@ class SettingsHandler:
         await state.set_state(AutoTraderStates.awaiting_budget)
         await message.answer("Enter total budget (USD):")
 
+    async def autotrader_dest_here(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(destination_chat_id=query.message.chat.id, destination_type="chat")
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await query.message.edit_text("Enter total budget (USD):")
+        await query.answer()
+
+    async def autotrader_dest_dm(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(destination_chat_id=query.from_user.id, destination_type="dm")
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await query.message.edit_text("Enter total budget (USD):")
+        await query.answer()
+
+    async def autotrader_dest_custom(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(AutoTraderStates.awaiting_destination)
+        await query.message.edit_text("Send the chat ID to receive alerts/reports:")
+        await query.answer()
+
     async def autotrader_get_budget(self, message: types.Message, state: FSMContext) -> None:
         try:
             budget = float(message.text.replace(",", ""))

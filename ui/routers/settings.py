@@ -123,6 +123,21 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
         admin_filter,
     )
     dispatcher.callback_query.register(
+        handler.autotrader_dest_here,
+        F.data == "autotrader:dest:here",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_dest_dm,
+        F.data == "autotrader:dest:dm",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_dest_custom,
+        F.data == "autotrader:dest:custom",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
         lambda q: handler.show_autotrader_errors(q, page=1),
         F.data == "settings:autotrader_errors",
         admin_filter,
