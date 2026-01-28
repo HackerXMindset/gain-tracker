@@ -207,7 +207,7 @@ class SettingsHandler:
             await query.answer("AutoTrader is disabled. Set ENABLE_AUTOTRADER=true to enable.", show_alert=True)
             return
         await state.clear()
-        await state.set_state(AutoTraderStates.awaiting_budget)
+        await state.set_state(AutoTraderStates.awaiting_destination)
 
         # Stats summary
         runs = await self.autotrader_runs.db.fetch(
@@ -225,10 +225,34 @@ class SettingsHandler:
             "Live invest with fresh data (≤15s) using your budget, per-coin spend, channels, and hold.\n\n"
             f"Runs — pending:{status_counts.get('pending',0)} running:{status_counts.get('running',0)} completed:{status_counts.get('completed',0)}\n"
             f"Skips (last 24h): {skips_24h or 0}\n\n"
-            "Enter total budget (USD) to begin setup:"
+            "Where should alerts/reports go?\n"
+            "- Send 'here' to use this chat\n"
+            "- Send 'dm' to use your DM\n"
+            "- Or send a chat ID\n"
         )
         await query.message.edit_text(text)
         await query.answer()
+
+    async def autotrader_get_destination(self, message: types.Message, state: FSMContext) -> None:
+        txt = message.text.strip().lower()
+        dest_chat_id = None
+        dest_type = "chat"
+        if txt == "here":
+            dest_chat_id = message.chat.id
+            dest_type = "chat"
+        elif txt == "dm":
+            dest_chat_id = message.from_user.id
+            dest_type = "dm"
+        else:
+            try:
+                dest_chat_id = int(txt)
+                dest_type = "chat"
+            except Exception:
+                await message.answer("Send 'here', 'dm', or a numeric chat ID.")
+                return
+        await state.update_data(destination_chat_id=dest_chat_id, destination_type=dest_type)
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await message.answer("Enter total budget (USD):")
 
     async def autotrader_get_budget(self, message: types.Message, state: FSMContext) -> None:
         try:
@@ -323,14 +347,16 @@ class SettingsHandler:
         coin_cap = data["coin_cap"]
         channel_mode = data["channel_mode"]
         channels = data.get("channels", [])
+        destination_chat_id = data.get("destination_chat_id") or message.chat.id
+        destination_type = data.get("destination_type") or "chat"
 
         # Create run
         run_id = await self.autotrader_runs.create_run(
             {
                 "name": f"AutoTrader {channel_mode}",
                 "created_by_user_id": message.from_user.id,
-                "destination_chat_id": message.chat.id,
-                "destination_type": "chat",
+                "destination_chat_id": destination_chat_id,
+                "destination_type": destination_type,
                 "status": "pending",
                 "start_at": None,
                 "stop_at": None,
@@ -356,10 +382,52 @@ class SettingsHandler:
             f"Budget: ${budget_total:,.2f} | Per-coin: ${per_coin:,.2f}\n"
             f"Hold: {hold_seconds//60} min | Coin cap: {coin_cap}\n"
             f"Channels: {'all' if not channels else ', '.join(channels)} (mode: {channel_mode})\n"
+            f"Destination: {destination_type} ({destination_chat_id})\n"
             f"Report interval: {'off' if interval is None else str(interval//60)+' min'}\n"
             "Status: pending (engine wiring next)."
         )
         await message.answer(summary, reply_markup=self.keyboards.settings_menu())
+
+    async def show_autotrader_errors(self, query: types.CallbackQuery) -> None:
+        if not settings.enable_autotrader:
+            await query.answer("AutoTrader is disabled.", show_alert=True)
+            return
+        try:
+            summary = await self.autotrader_runs.db.fetch(
+                """
+                SELECT COALESCE(event_type,'skip') AS reason, COUNT(*) AS c
+                FROM autotrader_events
+                WHERE event_type='skip'
+                GROUP BY COALESCE(event_type,'skip')
+                ORDER BY c DESC
+                """
+            )
+            details = await self.autotrader_runs.db.fetch(
+                """
+                SELECT event_type, message, created_at
+                FROM autotrader_events
+                WHERE event_type='skip'
+                ORDER BY created_at DESC
+                LIMIT 20
+                """
+            )
+            text = "<b>⚠️ AutoTrader Skips / Errors</b>\n\n"
+            if summary:
+                for row in summary:
+                    text += f"{row['reason']}: {row['c']}\n"
+            else:
+                text += "No skips recorded.\n"
+            text += "\n<b>Recent Skips</b>\n"
+            if details:
+                for row in details:
+                    text += f"{row['created_at']}: {row['message']}\n"
+            else:
+                text += "None\n"
+            await query.message.edit_text(text, reply_markup=self.keyboards.back_to_settings())
+            await query.answer()
+        except Exception as exc:
+            logger.error("Error showing autotrader errors: %s", exc, exc_info=True)
+            await query.answer("❌ Error loading autotrader errors", show_alert=True)
     async def show_autotrader_entry(self, query: types.CallbackQuery) -> None:
         if not settings.enable_autotrader:
             await query.answer("AutoTrader is disabled. Set ENABLE_AUTOTRADER=true to enable.", show_alert=True)

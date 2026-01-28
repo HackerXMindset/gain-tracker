@@ -122,8 +122,18 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
         F.data.startswith("settings:autotrader"),
         admin_filter,
     )
+    dispatcher.callback_query.register(
+        handler.show_autotrader_errors,
+        F.data.startswith("settings:autotrader_errors"),
+        admin_filter,
+    )
 
     # AutoTrader FSM (simple linear wizard)
+    dispatcher.message.register(
+        handler.autotrader_get_destination,
+        StateFilter(AutoTraderStates.awaiting_destination),
+        admin_filter,
+    )
     dispatcher.message.register(
         handler.autotrader_get_budget,
         StateFilter(AutoTraderStates.awaiting_budget),
