@@ -570,7 +570,8 @@ class DexService:
 
             multiplier_value = float(current_mc / first_seen_mc)
             elapsed = self._format_elapsed_time(first_seen_at)
-            ticker_display = ticker or address[:8]
+            bad_symbols = {"SPL", "SOL", "TOKEN"}
+            ticker_display = ticker if ticker and ticker.upper() not in bad_symbols else address[:8]
 
             template_context = {
                 "address": address,
