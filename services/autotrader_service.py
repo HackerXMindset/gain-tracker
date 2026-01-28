@@ -277,17 +277,17 @@ class AutoTraderService:
         address = token["address"]
         price, mc = await self._fetch_fresh_price(address, max_retries, freshness_secs)
         if price is None or mc is None or price <= 0:
-            await self.events.log(run_id, "skip", f"Stale or missing price for {address[:8]}")
+            await self._log_skip(run_id, address, "stale_or_missing_price")
             return False
         # Liquidity/fee parity with /invest: require liquidity >= 0.1 * mc
         pair = await self.dex.fetch_token(address, chain_id="solana", use_cache=False)
         liq = self.dex.get_liquidity(pair) if pair else None
         if liq is None or mc is None or (liq is not None and mc is not None and liq < (mc * Decimal("0.10"))):
-            await self.events.log(run_id, "skip", f"Low liquidity for {address[:8]}")
+            await self._log_skip(run_id, address, "low_liquidity")
             return False
         eff_price, eff_qty, fees = self._apply_fees_and_slippage(spend, price, liq)
         if eff_qty <= 0:
-            await self.events.log(run_id, "skip", f"Fees/slippage zeroed qty for {address[:8]}")
+            await self._log_skip(run_id, address, "fees_slippage_zero_qty")
             return False
         await self.positions.create_position(run_id, token_id, spend, eff_price, mc, eff_qty)
         await self.events.log(run_id, "buy", f"Bought {address[:8]} spend ${spend:,.2f} @ ${eff_price:.8f} (qty {eff_qty:.6f}, fees {fees})")
@@ -356,3 +356,6 @@ class AutoTraderService:
             return None, price
         sell_amount = qty * price
         return sell_amount, price
+
+    async def _log_skip(self, run_id: int, address: str, reason: str) -> None:
+        await self.events.log(run_id, "skip", f"{reason} for {address[:8]}", token_id=None)
