@@ -174,6 +174,21 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
         F.data.startswith("autotrader:cap:"),
         admin_filter,
     )
+    dispatcher.callback_query.register(
+        handler.autotrader_stop_choice,
+        F.data.startswith("autotrader:stop:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_channels_button,
+        F.data.startswith("autotrader:channels:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_interval_button,
+        F.data.startswith("autotrader:interval:"),
+        admin_filter,
+    )
     dispatcher.message.register(
         handler.autotrader_custom_coin_cap,
         StateFilter(AutoTraderStates.awaiting_custom_coin_cap),
@@ -187,6 +202,11 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
     dispatcher.message.register(
         handler.autotrader_custom_per_coin,
         StateFilter(AutoTraderStates.awaiting_custom_per_coin),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_custom_interval,
+        StateFilter(AutoTraderStates.awaiting_custom_interval),
         admin_filter,
     )
     dispatcher.message.register(

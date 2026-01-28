@@ -257,13 +257,13 @@ class SettingsHandler:
     async def autotrader_dest_here(self, query: types.CallbackQuery, state: FSMContext) -> None:
         await state.update_data(destination_chat_id=query.message.chat.id, destination_type="chat")
         await state.set_state(AutoTraderStates.awaiting_budget)
-        await query.message.edit_text("Enter total budget (USD):")
+        await query.message.edit_text("Enter total budget (USD):", reply_markup=self.keyboards.autotrader_budget())
         await query.answer()
 
     async def autotrader_dest_dm(self, query: types.CallbackQuery, state: FSMContext) -> None:
         await state.update_data(destination_chat_id=query.from_user.id, destination_type="dm")
         await state.set_state(AutoTraderStates.awaiting_budget)
-        await query.message.edit_text("Enter total budget (USD):")
+        await query.message.edit_text("Enter total budget (USD):", reply_markup=self.keyboards.autotrader_budget())
         await query.answer()
 
     async def autotrader_dest_custom(self, query: types.CallbackQuery, state: FSMContext) -> None:
@@ -460,6 +460,22 @@ class SettingsHandler:
         await state.set_state(AutoTraderStates.awaiting_report_interval)
         await message.answer("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:", reply_markup=self.keyboards.autotrader_interval())
 
+    async def autotrader_channels_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "all":
+            channels = []
+        elif val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_channels)
+            await query.message.edit_text("Provide channel IDs/usernames (comma separated) or 'all':")
+            await query.answer()
+            return
+        else:
+            channels = [val]
+        await state.update_data(channels=channels)
+        await state.set_state(AutoTraderStates.awaiting_report_interval)
+        await query.message.edit_text("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:", reply_markup=self.keyboards.autotrader_interval())
+        await query.answer()
+
     async def autotrader_get_report_interval(self, message: types.Message, state: FSMContext) -> None:
         txt = message.text.strip().lower()
         interval = None
@@ -517,7 +533,81 @@ class SettingsHandler:
             f"Channels: {'all' if not channels else ', '.join(channels)} (mode: {channel_mode})\n"
             f"Destination: {destination_type} ({destination_chat_id})\n"
             f"Report interval: {'off' if interval is None else str(interval//60)+' min'}\n"
+            f"Stop rules: target={data.get('target_value')}, bankrupt_floor={data.get('bankrupt_floor')}\n"
             "Status: pending (engine wiring next)."
+        )
+        await message.answer(summary, reply_markup=self.keyboards.settings_menu())
+
+    async def autotrader_interval_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_interval)
+            await query.message.edit_text("Enter report interval in minutes (e.g., 240):")
+            await query.answer()
+            return
+        if val == "skip":
+            interval = None
+        else:
+            interval = int(val) * 1
+        data = await state.get_data()
+        await self._finalize_autotrader_run(query.message, state, interval_seconds=interval)
+        await query.answer()
+
+    async def autotrader_custom_interval(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            minutes = int(message.text.strip())
+            if minutes <= 0:
+                raise ValueError
+            interval = minutes * 60
+        except Exception:
+            await message.answer("Enter minutes as a positive integer.")
+            return
+        await self._finalize_autotrader_run(message, state, interval_seconds=interval)
+
+    async def _finalize_autotrader_run(self, message: types.Message, state: FSMContext, interval_seconds: Optional[int]) -> None:
+        data = await state.get_data()
+        budget_total = data["budget_total"]
+        per_coin = data["per_coin_spend"]
+        hold_seconds = data["hold_seconds"]
+        coin_cap = data["coin_cap"]
+        channel_mode = data["channel_mode"]
+        channels = data.get("channels", [])
+        destination_chat_id = data.get("destination_chat_id") or message.chat.id
+        destination_type = data.get("destination_type") or "chat"
+        run_id = await self.autotrader_runs.create_run(
+            {
+                "name": f"AutoTrader {channel_mode}",
+                "created_by_user_id": message.from_user.id,
+                "destination_chat_id": destination_chat_id,
+                "destination_type": destination_type,
+                "status": "pending",
+                "start_at": None,
+                "stop_at": None,
+                "budget_total": budget_total,
+                "per_coin_spend": per_coin,
+                "remaining_cash": budget_total,
+                "coin_cap": coin_cap,
+                "hold_seconds": hold_seconds,
+                "report_interval_seconds": interval_seconds,
+                "breakout_multiple": None,
+                "bankrupt_floor": data.get("bankrupt_floor"),
+                "target_value": data.get("target_value"),
+                "channel_mode": channel_mode,
+                "channels": channels if channels else None,
+                "freshness_secs": settings.autotrader_freshness_secs,
+                "max_retries": settings.autotrader_max_retries,
+            }
+        )
+        await state.clear()
+        summary = (
+            f"✅ AutoTrader run created (ID {run_id})\n"
+            f"Budget: ${budget_total:,.2f} | Per-coin: ${per_coin:,.2f}\n"
+            f"Hold: {hold_seconds//60} min | Coin cap: {coin_cap}\n"
+            f"Channels: {'all' if not channels else ', '.join(channels)} (mode: {channel_mode})\n"
+            f"Destination: {destination_type} ({destination_chat_id})\n"
+            f"Report interval: {'off' if interval_seconds is None else str(interval_seconds//60)+' min'}\n"
+            f"Stop rules: target={data.get('target_value')} bankrupt_floor={data.get('bankrupt_floor')}\n"
+            "Status: pending."
         )
         await message.answer(summary, reply_markup=self.keyboards.settings_menu())
 
