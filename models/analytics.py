@@ -577,6 +577,44 @@ class AnalyticsModel(BaseModel):
             "SELECT * FROM hold_timeframes ORDER BY display_order"
         )
 
+    async def get_max_hold_seconds(self) -> int:
+        """Return the maximum hold timeframe in seconds."""
+        value = await self.db.fetchval("SELECT MAX(seconds) FROM hold_timeframes")
+        return int(value) if value else 0
+
+    async def record_timeframe_attempt(
+        self,
+        token_id: int,
+        timeframe_seconds: int,
+        target_time: datetime,
+        status: str,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> None:
+        try:
+            await self.db.execute(
+                """
+                INSERT INTO timeframe_snapshot_attempts
+                    (token_id, timeframe_seconds, target_time, status, reason, source, detail)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                token_id,
+                timeframe_seconds,
+                target_time,
+                status,
+                reason,
+                source,
+                detail,
+            )
+        except Exception as exc:
+            logger.error(
+                "Error recording timeframe attempt token=%s tf=%s: %s",
+                token_id,
+                timeframe_seconds,
+                exc,
+            )
+
     async def analyze_best_hold(
         self,
         chat_id: Optional[int],

@@ -108,7 +108,10 @@ class TokenModel(BaseModel):
         return await self.db.fetch(
             """
             SELECT * FROM tokens_tracked
-            WHERE status = 'active'
+            WHERE (
+                status = 'active'
+                OR (status = 'stopped' AND tracking_until IS NOT NULL AND tracking_until > NOW())
+            )
               AND next_poll_at IS NOT NULL
             ORDER BY next_poll_at ASC
             """
@@ -121,10 +124,30 @@ class TokenModel(BaseModel):
             token_id,
         )
 
-    async def set_status(self, token_id: int, status: str) -> None:
+    async def set_status(
+        self,
+        token_id: int,
+        status: str,
+        tracking_until=None,
+    ) -> None:
+        if tracking_until is None:
+            if status == "active":
+                await self.db.execute(
+                    "UPDATE tokens_tracked SET status = $1, tracking_until = NULL WHERE id = $2",
+                    status,
+                    token_id,
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE tokens_tracked SET status = $1 WHERE id = $2",
+                    status,
+                    token_id,
+                )
+            return
         await self.db.execute(
-            "UPDATE tokens_tracked SET status = $1 WHERE id = $2",
+            "UPDATE tokens_tracked SET status = $1, tracking_until = $2 WHERE id = $3",
             status,
+            tracking_until,
             token_id,
         )
 
@@ -133,6 +156,54 @@ class TokenModel(BaseModel):
             "UPDATE tokens_tracked SET last_mc = $1 WHERE id = $2",
             market_cap,
             token_id,
+        )
+
+    async def update_last_api_error(
+        self,
+        token_address: str,
+        api_name: Optional[str],
+        status_code: Optional[int],
+        message: Optional[str],
+    ) -> None:
+        await self.db.execute(
+            """
+            UPDATE tokens_tracked
+            SET last_api_error_api = $2,
+                last_api_error_code = $3,
+                last_api_error_message = $4,
+                last_api_error_at = CASE WHEN $2 IS NULL THEN NULL ELSE NOW() END
+            WHERE address = $1
+            """,
+            token_address,
+            api_name,
+            status_code,
+            message,
+        )
+
+    async def get_id_by_address(self, address: str) -> Optional[int]:
+        row = await self.db.fetchrow("SELECT id FROM tokens_tracked WHERE address = $1", address)
+        return row["id"] if row else None
+
+    async def update_last_api_error(
+        self,
+        address: str,
+        api_name: str,
+        status_code: Optional[int],
+        message: Optional[str],
+    ) -> None:
+        await self.db.execute(
+            """
+            UPDATE tokens_tracked
+            SET last_api_error_api = $1,
+                last_api_error_code = $2,
+                last_api_error_message = $3,
+                last_api_error_at = NOW()
+            WHERE address = $4
+            """,
+            api_name,
+            status_code,
+            message,
+            address,
         )
 
     async def get_token_stats(self) -> Dict[str, int]:

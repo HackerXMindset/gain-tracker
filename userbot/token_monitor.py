@@ -10,7 +10,10 @@ from typing import Any, Dict, Optional, Tuple
 from config import MAX_VALID_MARKET_CAP, MIN_VALID_MARKET_CAP
 from db import db
 from scheduler.dex_service import get_dex_service
-from services import get_dexscreener_client, get_jupiter_service, get_okx_service
+from services import get_dexscreener_client, get_dexpaprika_service
+from models.snapshot_tasks import SnapshotTasksModel
+from models.analytics import AnalyticsModel
+from models.analytics import AnalyticsModel
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +22,16 @@ class TokenMonitor:
     def __init__(self, userbot_id: int) -> None:
         self.userbot_id = userbot_id
         self.dex_client = get_dexscreener_client()
-        self.okx_service = get_okx_service()
+        self.dexpaprika_service = get_dexpaprika_service()
+        self.snapshot_model = SnapshotTasksModel(db)
+        self.analytics_model = AnalyticsModel(db)
 
     async def _fetch_market_snapshot(
         self,
         address: str,
         blockchain: str,
     ) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[str]]:
-        jupiter_service = get_jupiter_service()
+        dexpaprika_service = get_dexpaprika_service()
         dex_client = self.dex_client
         market_cap: Optional[Decimal] = None
         price: Optional[Decimal] = None
@@ -34,16 +39,20 @@ class TokenMonitor:
         token_data = None
 
         if blockchain.upper() == "SOL":
-            token_data = await jupiter_service.get_token_data(address, use_cache=False)
+            token_data = await dexpaprika_service.get_token_data(address, use_cache=False)
             if token_data:
-                market_cap = self._normalize_decimal(jupiter_service.get_market_cap(token_data))
-                price = self._normalize_decimal(jupiter_service.get_price(token_data))
-                ticker = jupiter_service.get_ticker(token_data)
+                market_cap = self._normalize_decimal(dexpaprika_service.get_market_cap(token_data))
+                price = self._normalize_decimal(dexpaprika_service.get_price(token_data))
+                ticker = dexpaprika_service.get_ticker(token_data)
 
             if market_cap is None:
-                okx_data = await self.okx_service.get_token_data(address, chain_id="501", use_cache=False)
-                if okx_data:
-                    market_cap = self._normalize_decimal(self.okx_service.get_market_cap(okx_data))
+                dexpaprika_data = await self.dexpaprika_service.get_token_data(
+                    address, network="solana", use_cache=False
+                )
+                if dexpaprika_data:
+                    market_cap = self._normalize_decimal(
+                        self.dexpaprika_service.get_market_cap(dexpaprika_data)
+                    )
 
         if market_cap is None:
             normalized_chain = blockchain.strip().upper()
@@ -118,7 +127,11 @@ class TokenMonitor:
 
             if token_record:
                 token_id = token_record["id"]
+                if market_cap and market_cap > 0:
+                    await self.analytics_model.record_mc_history(token_id, market_cap)
                 await dex_service.add_token_to_scheduler(token_id)
+                if settings.new_scheduler:
+                    await self._create_snapshot_tasks_for_token(token_id, token_record.get("first_seen_at"))
                 return token_id
 
             logger.error("Token %s not found after add_token", address)
@@ -149,6 +162,8 @@ class TokenMonitor:
                 if token_id is None:
                     logger.warning("[MONITOR] Unable to register %s for chat %s", address, chat_id)
                     return
+                if settings.new_scheduler:
+                    await self._create_snapshot_tasks_for_token(token_id, datetime.utcnow())
 
             market_cap, _, _ = await self._fetch_market_snapshot(address, blockchain)
             if market_cap is None or market_cap <= 0:
@@ -243,6 +258,18 @@ class TokenMonitor:
                 exc,
                 exc_info=True,
             )
+
+    async def _create_snapshot_tasks_for_token(self, token_id: int, first_seen_at: Optional[datetime]) -> None:
+        if not settings.new_scheduler:
+            return
+        if not first_seen_at:
+            return
+        try:
+            timeframes = await self.analytics_model.get_hold_timeframes(defaults_only=False)
+            seconds_list = [int(tf["seconds"]) for tf in timeframes if tf.get("seconds")]
+            await self.snapshot_model.backfill_for_token(token_id, first_seen_at, seconds_list)
+        except Exception as exc:
+            logger.error("Error creating snapshot tasks for token %s: %s", token_id, exc)
 
     @staticmethod
     def _normalize_decimal(value: Optional[Any]) -> Optional[Decimal]:

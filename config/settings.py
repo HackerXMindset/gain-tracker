@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # Market data
     dex_timeout: int = Field(default=10, env="DEX_TIMEOUT")
     dex_max_retries: int = Field(default=3, env="DEX_MAX_RETRIES")
+    jup_api_key: Optional[str] = Field(default=None, env="JUP_API_KEY")
+    jup_api_keys_raw: Optional[str] = Field(default=None, validation_alias="JUP_API_KEYS")
+    new_scheduler: bool = Field(default=False, env="NEW_SCHEDULER")
+    snapshot_tolerance_minutes: int = Field(default=10, env="SNAPSHOT_TOLERANCE_MINUTES")
+    snapshot_late_grace_minutes: int = Field(default=20, env="SNAPSHOT_LATE_GRACE_MINUTES")
 
     # Address patterns
     solana_pattern: str = Field(default=r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", env="SOLANA_PATTERN")
@@ -64,6 +69,12 @@ class Settings(BaseSettings):
             if admin_id <= 0:
                 raise ValueError(f"Invalid admin Telegram ID: {admin_id}")
         return value
+
+    @property
+    def jup_api_keys_list(self) -> List[str]:
+        if not self.jup_api_keys_raw:
+            return []
+        return [v.strip() for v in self.jup_api_keys_raw.split(",") if v.strip()]
 
     @property
     def admin_telegram_ids_list(self) -> List[int]:

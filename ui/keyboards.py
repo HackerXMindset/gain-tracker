@@ -277,6 +277,36 @@ class Keyboards:
         return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     @staticmethod
+    def scheduler_overview_navigation(page: int, total_pages: int) -> InlineKeyboardMarkup:
+        keyboard = []
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        text="⬅️ Prev",
+                        callback_data=f"settings:scheduler_overview:page:{page-1}",
+                    )
+                )
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    text=f"{page}/{total_pages}",
+                    callback_data="noop",
+                )
+            )
+            if page < total_pages:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        text="Next ➡️",
+                        callback_data=f"settings:scheduler_overview:page:{page+1}",
+                    )
+                )
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton(text="🔙 Back", callback_data="settings:token_status")])
+        return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    @staticmethod
     def gain_alerts_detail(
         chat_id: int,
         has_template: bool,

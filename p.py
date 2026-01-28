@@ -1,10 +1,8 @@
 import urllib.request
 
 addr = input("Token contract address: ").strip()
-url = (
-    "https://web3.okx.com/priapi/v1/dx/market/v2/token/overview"
-    f"?chainId=501&tokenContractAddress={addr}"
-)
+network = "solana"
+url = f"https://api.dexpaprika.com/networks/{network}/tokens/{addr}"
 
 try:
     with urllib.request.urlopen(url, timeout=10) as resp:

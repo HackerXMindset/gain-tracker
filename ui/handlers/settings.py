@@ -12,7 +12,8 @@ from typing import Dict, Optional, Tuple
 from aiogram import types
 from aiogram.fsm.context import FSMContext
 
-from models import ChartRequestGroupModel, SettingsModel, AnalyticsModel
+from models import ChartRequestGroupModel, SettingsModel, AnalyticsModel, ApiMetricsModel
+from config import settings
 from scheduler import get_dex_service
 from ui.keyboards import Keyboards
 from ui.states import AdminStates
@@ -586,8 +587,21 @@ class SettingsHandler:
 
     async def show_scheduler_overview(self, query: types.CallbackQuery) -> None:
         try:
+            page = 1
+            parts = (query.data or "").split(":")
+            if len(parts) >= 4 and parts[2] == "page":
+                try:
+                    page = max(1, int(parts[3]))
+                except ValueError:
+                    page = 1
+
             dex_service = get_dex_service()
             stats = await dex_service.get_service_stats()
+            api_metrics_model = ApiMetricsModel(self.db)
+            api_metrics = await api_metrics_model.get_all()
+            api_24h = await api_metrics_model.get_last_24h()
+            api_map = {row["api_name"]: row for row in api_metrics}
+            api_24h_map = {row["api_name"]: row for row in api_24h}
 
             tier_counts = await self.db.fetch(
                 """
@@ -602,6 +616,77 @@ class SettingsHandler:
             stopped_count = await self.db.fetchval(
                 "SELECT COUNT(*) FROM tokens_tracked WHERE status = 'stopped'"
             )
+
+            active_tracking_count = await self.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM tokens_tracked
+                WHERE status = 'active'
+                   OR (status = 'stopped' AND tracking_until IS NOT NULL AND tracking_until > NOW())
+                """
+            )
+
+            # New source of truth: snapshot_tasks
+            missing_timeframes_count = await self.db.fetchval(
+                """
+                SELECT COUNT(DISTINCT token_id)
+                FROM snapshot_tasks
+                WHERE status IN ('pending','failed','due','late')
+                  AND target_time < NOW() - interval '1 minute'
+                """
+            )
+
+            missing_reason_rows = await self.db.fetch(
+                """
+                SELECT COALESCE(last_error_message, status) AS reason, COUNT(*) AS count
+                FROM snapshot_tasks
+                WHERE status IN ('pending','failed','late','due')
+                  AND target_time < NOW() - interval '1 minute'
+                GROUP BY COALESCE(last_error_message, status)
+                ORDER BY count DESC, reason
+                """
+            )
+
+            items_per_page = 6
+            offset = (page - 1) * items_per_page
+
+            missing_details = await self.db.fetch(
+                """
+                SELECT
+                    tt.address,
+                    COALESCE(ht.label, CONCAT(st.timeframe_seconds, 's')) AS label,
+                    st.target_time,
+                    COALESCE(st.last_error_message, st.status) AS reason,
+                    COALESCE(st.recorded_source, '-') AS source,
+                    st.last_error_message AS detail,
+                    st.last_error_api AS last_api_error_api,
+                    st.last_error_code AS last_api_error_code,
+                    st.last_error_message AS last_api_error_message,
+                    to_char(st.last_error_at AT TIME ZONE $3, 'YYYY-MM-DD HH24:MI:SS') AS last_api_error_at_local,
+                    st.target_time AT TIME ZONE $3 AS target_time_local
+                FROM snapshot_tasks st
+                JOIN tokens_tracked tt ON tt.id = st.token_id
+                LEFT JOIN hold_timeframes ht ON ht.seconds = st.timeframe_seconds
+                WHERE st.status IN ('pending','failed','late','due')
+                  AND st.target_time < NOW() - interval '1 minute'
+                ORDER BY st.target_time DESC
+                LIMIT $1 OFFSET $2
+                """,
+                items_per_page,
+                offset,
+                settings.timezone or "UTC",
+            )
+
+            missing_total = await self.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM snapshot_tasks
+                WHERE status IN ('pending','failed','late','due')
+                  AND target_time < NOW() - interval '1 minute'
+                """
+            )
+
+            total_pages = max(1, (int(missing_total or 0) + items_per_page - 1) // items_per_page)
 
             tier_map = {
                 "tier_a": ("Tier A (10s)", 0),
@@ -622,17 +707,86 @@ class SettingsHandler:
                 f"🔄 <b>Scheduler Active:</b> {'✅ Yes' if stats['scheduler_active'] else '❌ No'}\n"
                 f"📦 <b>Tokens in Queue:</b> {stats['tokens_in_queue']}\n"
                 f"⚙️ <b>Service Running:</b> {'✅ Yes' if stats['running'] else '❌ No'}\n\n"
+                f"🧾 <b>Active Timeframe Recording:</b> {active_tracking_count or 0} tokens\n"
+                f"⚠️ <b>Missing Timeframes:</b> {missing_timeframes_count or 0} tokens\n\n"
                 "<b>📈 By Tier:</b>\n"
             )
 
             for tier_name, count in tier_map.values():
                 text += f"  ├ {tier_name}: {count} tokens\n"
 
-            text += f"\n⛔ <b>Stopped:</b> {stopped_count or 0} tokens"
+            text += f"\n⛔ <b>Stopped:</b> {stopped_count or 0} tokens\n\n"
+
+            def _metric(name: str) -> tuple[int, int]:
+                row = api_map.get(name, {})
+                return int(row.get("total_checks", 0) or 0), int(row.get("total_errors", 0) or 0)
+
+            def _daily_metric(name: str) -> tuple[int, int]:
+                row = api_24h_map.get(name, {})
+                return int(row.get("total_checks", 0) or 0), int(row.get("total_errors", 0) or 0)
+
+            j_checks, j_err = _metric("jupiter")
+            d_checks, d_err = _metric("dexpaprika")
+            x_checks, x_err = _metric("dexscreener")
+
+            j_checks_d, j_err_d = _daily_metric("jupiter")
+            d_checks_d, d_err_d = _daily_metric("dexpaprika")
+            x_checks_d, x_err_d = _daily_metric("dexscreener")
+
+            text += (
+                "<b>🌐 API Checks (All‑Time)</b>\n"
+                f"  ├ Jupiter: {j_checks} checks, {j_err} errors\n"
+                f"  ├ DexPaprika: {d_checks} checks, {d_err} errors\n"
+                f"  └ DexScreener: {x_checks} checks, {x_err} errors\n\n"
+                "<b>🌐 API Checks (Last 24h)</b>\n"
+                f"  ├ Jupiter: {j_checks_d} checks, {j_err_d} errors\n"
+                f"  ├ DexPaprika: {d_checks_d} checks, {d_err_d} errors\n"
+                f"  └ DexScreener: {x_checks_d} checks, {x_err_d} errors\n\n"
+                "<b>🧩 Missing Reasons</b>\n"
+            )
+
+            if missing_reason_rows:
+                for row in missing_reason_rows[:6]:
+                    reason = row["reason"]
+                    count = row["count"]
+                    text += f"  ├ {reason}: {count}\n"
+            else:
+                text += "  └ None\n"
+
+            text += "\n<b>📄 Missing Details</b>\n"
+            if missing_details:
+                for idx, row in enumerate(missing_details, start=1 + offset):
+                    address = row["address"] or "unknown"
+                    label = html.escape(row.get("label") or "-")
+                    reason = html.escape(row.get("reason") or "no_attempt")
+                    source = html.escape(row.get("source") or "-")
+                    detail_bits = []
+                    code = row.get("last_error_code")
+                    msg = row.get("last_error_message")
+                    at_local = row.get("last_error_at_local")
+                    target_local = row.get("target_time_local")
+                    if code is not None or msg:
+                        code_label = "-" if code is None else str(code)
+                        msg_label = html.escape(str(msg)) if msg else "-"
+                        if at_local:
+                            detail_bits.append(f"{code_label} {msg_label} @ {html.escape(str(at_local))}")
+                        else:
+                            detail_bits.append(f"{code_label} {msg_label}")
+                    if target_local:
+                        detail_bits.append(f"target={target_local}")
+
+                    suffix = ""
+                    if detail_bits:
+                        suffix = " | " + "; ".join(detail_bits)
+
+                    text += f"{idx}. {address[:8]} ({label}) — {reason} [{source}]{suffix}\n"
+                text += f"\nPage {page}/{total_pages}"
+            else:
+                text += "No missing timeframe details."
 
             await query.message.edit_text(
                 text,
-                reply_markup=self.keyboards.back_button("settings:token_status"),
+                reply_markup=self.keyboards.scheduler_overview_navigation(page, total_pages),
             )
             await query.answer()
 

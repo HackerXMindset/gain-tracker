@@ -9,7 +9,7 @@ from typing import Optional
 from alerts.management_bot import ManagementBot
 from config import settings
 from db import db
-from scheduler import get_dex_service, get_command_forwarding_service
+from scheduler import get_dex_service, get_command_forwarding_service, SnapshotScheduler
 from scheduler.stats_refresh import get_stats_refresh_service
 from userbot import UserbotManager
 from utils.logging_setup import configure_logging
@@ -44,6 +44,7 @@ async def run() -> None:
     cmd_fwd_service = None
     management_bot = None
     admin_bot_task: Optional[asyncio.Task] = None
+    snapshot_scheduler: Optional[SnapshotScheduler] = None
 
     services_started = {
         "stats": False,
@@ -76,6 +77,11 @@ async def run() -> None:
         await dex_service.start()
         services_started["dex"] = True
 
+        if settings.new_scheduler:
+            snapshot_scheduler = SnapshotScheduler()
+            await snapshot_scheduler.start()
+            services_started["snapshot"] = True
+
         # Start admin bot in the same process (for /tri chart support)
         if settings.mgmt_bot_token:
             from admin_bot import create_admin_dispatcher
@@ -94,6 +100,8 @@ async def run() -> None:
             admin_bot_task.cancel()
             with suppress(asyncio.CancelledError):
                 await admin_bot_task
+        if services_started.get("snapshot") and snapshot_scheduler:
+            await snapshot_scheduler.stop()
         if services_started["dex"] and dex_service:
             await dex_service.stop()
         if services_started["cmd_fwd"] and cmd_fwd_service:

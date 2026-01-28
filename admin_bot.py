@@ -8,6 +8,7 @@ import logging
 import re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -114,6 +115,18 @@ async def run_admin_bot() -> None:
         if decimal_value <= 0:
             return "N/A"
         return DexService._format_mc_shorthand(decimal_value)
+
+    async def _compute_tracking_until(first_seen_at) -> Optional[datetime]:
+        max_hold_seconds = await analytics_model.get_max_hold_seconds()
+        if not max_hold_seconds:
+            return None
+        base_time = first_seen_at or datetime.now(timezone.utc)
+        if base_time.tzinfo is None:
+            base_time = base_time.replace(tzinfo=timezone.utc)
+        tracking_until = base_time + timedelta(seconds=max_hold_seconds)
+        if tracking_until <= datetime.now(timezone.utc):
+            return None
+        return tracking_until
 
     async def cmd_all_commands(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
@@ -367,7 +380,8 @@ async def run_admin_bot() -> None:
             )
             return
 
-        await token_model.set_status(token_id, "stopped")
+        tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+        await token_model.set_status(token_id, "stopped", tracking_until)
         await token_model.set_stop_reason(token_id, "admin_manual_stop")
 
         ticker = token.get("ticker") or raw_address[:8]
@@ -385,13 +399,23 @@ async def run_admin_bot() -> None:
 
         parts = (message.text or "").split()
         if len(parts) == 1:
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
             result = await db.execute(
                 """
                 UPDATE tokens_tracked
                 SET status = 'stopped',
-                    stop_reason = 'admin_ca_stop_all'
+                    stop_reason = 'admin_ca_stop_all',
+                    tracking_until = CASE
+                        WHEN $1::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($1::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($1::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
                 WHERE status != 'stopped'
                 """
+                ,
+                max_hold_seconds,
             )
             count = int(result.split()[-1]) if result.startswith("UPDATE") else 0
             await message.answer(f"⛔ Stopped monitoring all contracts ({count} updated).", parse_mode="HTML")
@@ -414,14 +438,23 @@ async def run_admin_bot() -> None:
                 await message.answer(f"❌ No contracts found for chat <code>{chat_id_arg}</code>.", parse_mode="HTML")
                 return
             token_ids = [row["token_id"] for row in token_rows]
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
             await db.execute(
                 """
                 UPDATE tokens_tracked
                 SET status = 'stopped',
-                    stop_reason = 'admin_ca_stop_chat'
+                    stop_reason = 'admin_ca_stop_chat',
+                    tracking_until = CASE
+                        WHEN $2::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($2::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($2::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
                 WHERE id = ANY($1::BIGINT[])
                 """,
                 token_ids,
+                max_hold_seconds,
             )
             await message.answer(
                 f"⛔ Stopped monitoring {len(token_ids)} contract(s) for chat <code>{chat_id_arg}</code>.",
@@ -449,7 +482,8 @@ async def run_admin_bot() -> None:
                 not_found.append(address)
                 continue
 
-            await token_model.set_status(token["id"], "stopped")
+            tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+            await token_model.set_status(token["id"], "stopped", tracking_until)
             await token_model.set_stop_reason(token["id"], "admin_ca_stop")
             stopped += 1
 
@@ -547,8 +581,16 @@ async def run_admin_bot() -> None:
             )
             return
 
-        await db.execute("DELETE FROM tokens_tracked")
-        await message.answer("✅ All tracked contract addresses have been wiped.", parse_mode="HTML")
+        await db.execute("TRUNCATE tokens_tracked CASCADE")
+        await db.execute("TRUNCATE timeframe_snapshot_attempts RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_daily RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_hourly RESTART IDENTITY")
+        await message.answer(
+            "✅ All tracked contract addresses have been wiped.\n"
+            "✅ Snapshot reasons and API check metrics cleared.",
+            parse_mode="HTML",
+        )
 
     async def cmd_trigger(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
@@ -1210,7 +1252,8 @@ async def create_admin_dispatcher() -> None:
         if not token:
             await message.answer(f"❌ Token not found", parse_mode="HTML")
             return
-        await token_model.set_status(token["id"], "stopped")
+        tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+        await token_model.set_status(token["id"], "stopped", tracking_until)
         await token_model.set_stop_reason(token["id"], "admin_manual_stop")
         await message.answer(f"✅ Stopped {token.get('ticker') or raw_address[:8]}", parse_mode="HTML")
 
@@ -1220,13 +1263,23 @@ async def create_admin_dispatcher() -> None:
 
         parts = (message.text or "").split()
         if len(parts) == 1:
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
             result = await db.execute(
                 """
                 UPDATE tokens_tracked
                 SET status = 'stopped',
-                    stop_reason = 'admin_ca_stop_all'
+                    stop_reason = 'admin_ca_stop_all',
+                    tracking_until = CASE
+                        WHEN $1::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($1::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($1::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
                 WHERE status != 'stopped'
                 """
+                ,
+                max_hold_seconds,
             )
             count = int(result.split()[-1]) if result.startswith("UPDATE") else 0
             await message.answer(f"⛔ Stopped monitoring all contracts ({count} updated).", parse_mode="HTML")
@@ -1249,14 +1302,23 @@ async def create_admin_dispatcher() -> None:
                 await message.answer(f"❌ No contracts found for chat <code>{chat_id_arg}</code>.", parse_mode="HTML")
                 return
             token_ids = [row["token_id"] for row in token_rows]
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
             await db.execute(
                 """
                 UPDATE tokens_tracked
                 SET status = 'stopped',
-                    stop_reason = 'admin_ca_stop_chat'
+                    stop_reason = 'admin_ca_stop_chat',
+                    tracking_until = CASE
+                        WHEN $2::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($2::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($2::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
                 WHERE id = ANY($1::BIGINT[])
                 """,
                 token_ids,
+                max_hold_seconds,
             )
             await message.answer(
                 f"⛔ Stopped monitoring {len(token_ids)} contract(s) for chat <code>{chat_id_arg}</code>.",
@@ -1284,7 +1346,8 @@ async def create_admin_dispatcher() -> None:
                 not_found.append(address)
                 continue
 
-            await token_model.set_status(token["id"], "stopped")
+            tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+            await token_model.set_status(token["id"], "stopped", tracking_until)
             await token_model.set_stop_reason(token["id"], "admin_ca_stop")
             stopped += 1
 
@@ -1382,8 +1445,16 @@ async def create_admin_dispatcher() -> None:
             )
             return
 
-        await db.execute("DELETE FROM tokens_tracked")
-        await message.answer("✅ All tracked contract addresses have been wiped.", parse_mode="HTML")
+        await db.execute("TRUNCATE tokens_tracked CASCADE")
+        await db.execute("TRUNCATE timeframe_snapshot_attempts RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_daily RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_hourly RESTART IDENTITY")
+        await message.answer(
+            "✅ All tracked contract addresses have been wiped.\n"
+            "✅ Snapshot reasons and API check metrics cleared.",
+            parse_mode="HTML",
+        )
 
     async def cmd_trigger(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
