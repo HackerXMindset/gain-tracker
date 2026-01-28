@@ -437,22 +437,6 @@ class SettingsHandler:
         except Exception as exc:
             logger.error("Error showing autotrader errors: %s", exc, exc_info=True)
             await query.answer("❌ Error loading autotrader errors", show_alert=True)
-    async def show_autotrader_entry(self, query: types.CallbackQuery) -> None:
-        if not settings.enable_autotrader:
-            await query.answer("AutoTrader is disabled. Set ENABLE_AUTOTRADER=true to enable.", show_alert=True)
-            return
-        try:
-            await query.message.edit_text(
-                "<b>🤖 AutoTrader</b>\n"
-                "Live invest with fresh data (≤15s), per-coin spend, budget, coin caps, and alerts.\n"
-                "Setup flow is coming next.",
-                reply_markup=self.keyboards.back_to_settings(),
-            )
-            await query.answer()
-        except Exception as exc:
-            logger.error("Error showing autotrader entry: %s", exc)
-            await query.answer("❌ Error loading AutoTrader", show_alert=True)
-
     async def show_gain_alert_settings(self, query: types.CallbackQuery) -> None:
         try:
             text, keyboard = await self._build_gain_alert_settings_view()
