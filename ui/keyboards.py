@@ -181,6 +181,12 @@ class Keyboards:
         ])
 
     @staticmethod
+    def back_to_settings() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Back to Settings", callback_data="settings:main")],
+        ])
+
+    @staticmethod
     def gain_alert_settings_menu(
         gain_threshold: float,
         drop_threshold: float,

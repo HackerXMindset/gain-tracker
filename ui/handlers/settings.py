@@ -208,11 +208,26 @@ class SettingsHandler:
             return
         await state.clear()
         await state.set_state(AutoTraderStates.awaiting_budget)
-        await query.message.edit_text(
-            "<b>🤖 AutoTrader</b>\n"
-            "Live invest with fresh data (≤15s). We’ll ask a few fields.\n\n"
-            "Enter total budget (USD):",
+
+        # Stats summary
+        runs = await self.autotrader_runs.db.fetch(
+            "SELECT status, COUNT(*) AS c FROM autotrader_runs GROUP BY status"
         )
+        status_counts = {r["status"]: r["c"] for r in runs}
+        skips_24h = await self.autotrader_runs.db.fetchval(
+            """
+            SELECT COUNT(*) FROM autotrader_events
+            WHERE event_type='skip' AND created_at >= NOW() - interval '24 hours'
+            """
+        )
+        text = (
+            "<b>🤖 AutoTrader</b>\n"
+            "Live invest with fresh data (≤15s) using your budget, per-coin spend, channels, and hold.\n\n"
+            f"Runs — pending:{status_counts.get('pending',0)} running:{status_counts.get('running',0)} completed:{status_counts.get('completed',0)}\n"
+            f"Skips (last 24h): {skips_24h or 0}\n\n"
+            "Enter total budget (USD) to begin setup:"
+        )
+        await query.message.edit_text(text)
         await query.answer()
 
     async def autotrader_get_budget(self, message: types.Message, state: FSMContext) -> None:
