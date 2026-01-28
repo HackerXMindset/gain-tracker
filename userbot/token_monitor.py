@@ -7,12 +7,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 
-from config import MAX_VALID_MARKET_CAP, MIN_VALID_MARKET_CAP
+from config import MAX_VALID_MARKET_CAP, MIN_VALID_MARKET_CAP, settings
 from db import db
 from scheduler.dex_service import get_dex_service
 from services import get_dexscreener_client, get_dexpaprika_service
 from models.snapshot_tasks import SnapshotTasksModel
-from models.analytics import AnalyticsModel
 from models.analytics import AnalyticsModel
 
 logger = logging.getLogger(__name__)
