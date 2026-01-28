@@ -17,6 +17,7 @@ class Keyboards:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📈 Gain Alerts", callback_data="gain_alerts:menu")],
+                [InlineKeyboardButton(text="🤖 AutoTrader", callback_data="settings:autotrader")],
                 [InlineKeyboardButton(text="👤 Agents", callback_data="menu:userbots")],
                 [InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings")],
             ]
