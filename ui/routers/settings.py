@@ -170,6 +170,12 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
         admin_filter,
     )
     dispatcher.callback_query.register(
+        handler.autotrader_per_coin_button,
+        StateFilter(AutoTraderStates.awaiting_per_coin),
+        F.data.startswith("autotrader:per:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
         handler.autotrader_coin_cap_button,
         F.data.startswith("autotrader:cap:"),
         admin_filter,
