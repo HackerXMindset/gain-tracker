@@ -47,6 +47,7 @@ class AutoTraderService:
         while self.running:
             try:
                 await self._process_pending()
+                await self._process_running()
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -61,7 +62,14 @@ class AutoTraderService:
         for row in rows:
             run_id = row["id"]
             await self.runs.update_status(run_id, "running")
-            await self.events.log(run_id, "info", "Run started (placeholder engine)")
-            # Placeholder completion until engine implemented
-            await self.runs.update_status(run_id, "completed")
+            await self.events.log(run_id, "info", "Run started")
+
+    async def _process_running(self) -> None:
+        rows = await self.runs.db.fetch(
+            "SELECT * FROM autotrader_runs WHERE status='running' ORDER BY updated_at ASC LIMIT 10"
+        )
+        for row in rows:
+            run_id = row["id"]
+            # Placeholder: in next phase, process coins. For now, complete immediately.
             await self.events.log(run_id, "info", "Run completed (engine placeholder)")
+            await self.runs.update_status(run_id, "completed")
