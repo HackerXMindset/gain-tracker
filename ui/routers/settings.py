@@ -117,6 +117,12 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
         admin_filter,
     )
 
+    dispatcher.callback_query.register(
+        handler.show_autotrader_entry,
+        F.data.startswith("settings:autotrader"),
+        admin_filter,
+    )
+
     async def tokens_list_callback(query) -> None:
         status = query.data.split(":")[-2]
         page = int(query.data.split(":")[-1])

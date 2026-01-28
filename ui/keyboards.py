@@ -175,6 +175,7 @@ class Keyboards:
             [InlineKeyboardButton(text="📈 Gain Alerts", callback_data="gain_alerts:menu")],
             [InlineKeyboardButton(text="🌙 Gain Alert Settings", callback_data="settings:gain_alerts")],
             [InlineKeyboardButton(text="📊 Token Status", callback_data="settings:token_status")],
+            [InlineKeyboardButton(text="🤖 AutoTrader", callback_data="settings:autotrader")],
             [InlineKeyboardButton(text="🏆 Rank", callback_data="cmd_fwd:list")],
             [InlineKeyboardButton(text="🔙 Back", callback_data="menu:main")],
         ])

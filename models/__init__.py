@@ -10,6 +10,12 @@ from .analytics import AnalyticsModel
 from .group import GroupModel
 from .command_forwarding import CommandForwardingRuleModel, CommandTrackedMessageModel
 from .snapshot_tasks import SnapshotTasksModel
+from .autotrader import (
+    AutoTraderRunModel,
+    AutoTraderPositionModel,
+    AutoTraderEventModel,
+    AutoTraderReportModel,
+)
 
 __all__ = [
     "BaseModel",
@@ -25,5 +31,9 @@ __all__ = [
     "CommandForwardingRuleModel",
     "CommandTrackedMessageModel",
     "SnapshotTasksModel",
+    "AutoTraderRunModel",
+    "AutoTraderPositionModel",
+    "AutoTraderEventModel",
+    "AutoTraderReportModel",
     "clear_gain_alert_template_cache",
 ]

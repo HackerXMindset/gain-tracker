@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     snapshot_tolerance_minutes: int = Field(default=10, env="SNAPSHOT_TOLERANCE_MINUTES")
     snapshot_late_grace_minutes: int = Field(default=20, env="SNAPSHOT_LATE_GRACE_MINUTES")
 
+    # AutoTrader
+    enable_autotrader: bool = Field(default=False, env="ENABLE_AUTOTRADER")
+    autotrader_freshness_secs: int = Field(default=15, env="AUTOTRADER_FRESHNESS_SECS")
+    autotrader_max_retries: int = Field(default=10, env="AUTOTRADER_MAX_RETRIES")
+    autotrader_default_coin_cap: int = Field(default=100, env="AUTOTRADER_DEFAULT_COIN_CAP")
+
     # Address patterns
     solana_pattern: str = Field(default=r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", env="SOLANA_PATTERN")
     bnb_pattern: str = Field(default=r"0x[a-fA-F0-9]{40}\b", env="BNB_PATTERN")
