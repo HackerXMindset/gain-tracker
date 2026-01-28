@@ -256,22 +256,22 @@ class AutoTraderService:
         mode = run.get("channel_mode", "single")
         channels = run.get("channels") or []
 
-        base_query = """
-            SELECT t.id, t.address
-            FROM tokens_tracked t
-            WHERE t.status='active'
-        """
-        params = []
+        params = [limit]
+        filter_clause = ""
         if mode in {"single", "multi"} and channels:
-            # best-effort: filter by first_seen_source if exists, otherwise ignore filter
-            base_query += " AND (t.first_seen_source IS NULL OR t.first_seen_source = ANY($1))"
+            filter_clause = "AND tch.source_chat_id = ANY($2)"
             params.append(channels)
-            base_query += " ORDER BY COALESCE(t.last_checked_at, t.first_seen_at) DESC LIMIT $2"
-            params.append(limit)
-            return await self.token_model.db.fetch(base_query, *params)
-        else:
-            base_query += " ORDER BY COALESCE(t.last_checked_at, t.first_seen_at) DESC LIMIT $1"
-            return await self.token_model.db.fetch(base_query, limit)
+
+        query = f"""
+            SELECT t.id, t.address
+            FROM token_call_history tch
+            JOIN tokens_tracked t ON t.address = tch.token_address
+            WHERE t.status='active'
+            {filter_clause}
+            ORDER BY tch.called_at DESC
+            LIMIT $1
+        """
+        return await self.token_model.db.fetch(query, *params)
 
     async def _attempt_buy(self, run_id: int, token: dict, spend: float, max_retries: int, freshness_secs: int) -> bool:
         token_id = token["id"]
