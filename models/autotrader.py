@@ -55,6 +55,25 @@ class AutoTraderRunModel(BaseModel):
     async def get_run(self, run_id: int) -> Optional[dict]:
         return await self.db.fetchrow("SELECT * FROM autotrader_runs WHERE id=$1", run_id)
 
+    async def list_pending(self, limit: int = 20):
+        return await self.db.fetch(
+            "SELECT * FROM autotrader_runs WHERE status='pending' ORDER BY created_at ASC LIMIT $1",
+            limit,
+        )
+
+    async def list_running(self, limit: int = 20):
+        return await self.db.fetch(
+            "SELECT * FROM autotrader_runs WHERE status='running' ORDER BY updated_at ASC LIMIT $1",
+            limit,
+        )
+
+    async def update_remaining_cash(self, run_id: int, remaining: float) -> None:
+        await self.db.execute(
+            "UPDATE autotrader_runs SET remaining_cash=$2, updated_at=NOW() WHERE id=$1",
+            run_id,
+            remaining,
+        )
+
 
 class AutoTraderPositionModel(BaseModel):
     async def create_position(
@@ -78,6 +97,12 @@ class AutoTraderPositionModel(BaseModel):
             buy_price,
             buy_mc,
             qty,
+        )
+
+    async def list_open(self, run_id: int):
+        return await self.db.fetch(
+            "SELECT * FROM autotrader_positions WHERE run_id=$1 AND status='open'",
+            run_id,
         )
 
     async def close_position(

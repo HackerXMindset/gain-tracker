@@ -22,6 +22,12 @@ class TokenModel(BaseModel):
             address,
         )
 
+    async def get_by_id(self, token_id: int) -> Optional[asyncpg.Record]:
+        return await self.db.fetchrow(
+            "SELECT * FROM tokens_tracked WHERE id = $1",
+            token_id,
+        )
+
     async def create_or_update(
         self,
         address: str,
