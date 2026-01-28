@@ -295,7 +295,7 @@ class AutoTraderService:
         return True
 
     async def _fetch_fresh_price(self, address: str, max_retries: int, freshness_secs: int):
-        # Try cached first
+        # Try cached first (must be <= freshness_secs)
         cached = self.dex.get_cached_pair(address, chain_id="solana", freshness_secs=freshness_secs)
         if cached:
             price = self.dex.get_price(cached)
