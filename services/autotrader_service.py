@@ -263,13 +263,14 @@ class AutoTraderService:
         """
         params = []
         if mode in {"single", "multi"} and channels:
-            base_query += " AND t.first_seen_source = ANY($1)"
+            # best-effort: filter by first_seen_source if exists, otherwise ignore filter
+            base_query += " AND (t.first_seen_source IS NULL OR t.first_seen_source = ANY($1))"
             params.append(channels)
-            base_query += " ORDER BY t.first_seen_at DESC LIMIT $2"
+            base_query += " ORDER BY COALESCE(t.last_checked_at, t.first_seen_at) DESC LIMIT $2"
             params.append(limit)
             return await self.token_model.db.fetch(base_query, *params)
         else:
-            base_query += " ORDER BY t.first_seen_at DESC LIMIT $1"
+            base_query += " ORDER BY COALESCE(t.last_checked_at, t.first_seen_at) DESC LIMIT $1"
             return await self.token_model.db.fetch(base_query, limit)
 
     async def _attempt_buy(self, run_id: int, token: dict, spend: float, max_retries: int, freshness_secs: int) -> bool:
@@ -277,7 +278,7 @@ class AutoTraderService:
         address = token["address"]
         price, mc = await self._fetch_fresh_price(address, max_retries, freshness_secs)
         if price is None or mc is None or price <= 0:
-            await self._log_skip(run_id, address, "stale_or_missing_price")
+            await self._log_skip(run_id, address, "stale_retry_exceeded")
             return False
         # Liquidity/fee parity with /invest: require liquidity >= 0.1 * mc
         pair = await self.dex.fetch_token(address, chain_id="solana", use_cache=False)
