@@ -140,6 +140,21 @@ class AutoTraderEventModel(BaseModel):
             message,
         )
 
+    async def list_for_period(self, run_id: int, start: datetime, end: datetime, limit: int = 200, offset: int = 0):
+        return await self.db.fetch(
+            """
+            SELECT * FROM autotrader_events
+            WHERE run_id=$1 AND created_at BETWEEN $2 AND $3
+            ORDER BY created_at ASC
+            LIMIT $4 OFFSET $5
+            """,
+            run_id,
+            start,
+            end,
+            limit,
+            offset,
+        )
+
 
 class AutoTraderReportModel(BaseModel):
     async def enqueue_report(
@@ -159,4 +174,11 @@ class AutoTraderReportModel(BaseModel):
             period_start,
             period_end,
             delivered_to,
+        )
+
+    async def set_status(self, report_id: int, status: str) -> None:
+        await self.db.execute(
+            "UPDATE autotrader_reports SET status=$2 WHERE id=$1",
+            report_id,
+            status,
         )

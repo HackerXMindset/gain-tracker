@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS autotrader_events (
     token_id BIGINT REFERENCES tokens_tracked(id) ON DELETE SET NULL,
     event_type TEXT NOT NULL,
     message TEXT,
+    payload JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

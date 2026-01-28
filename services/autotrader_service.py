@@ -11,6 +11,7 @@ from models import (
     AutoTraderRunModel,
     AutoTraderEventModel,
     AutoTraderPositionModel,
+    AutoTraderReportModel,
 )
 from services import get_dexscreener_client
 from models.token import TokenModel
@@ -32,6 +33,7 @@ class AutoTraderService:
         self.runs = AutoTraderRunModel()
         self.events = AutoTraderEventModel()
         self.positions = AutoTraderPositionModel()
+        self.reports = AutoTraderReportModel()
         self.token_model = TokenModel()
         self.dex = get_dexscreener_client()
         self.analytics = AnalyticsModel()
@@ -62,6 +64,7 @@ class AutoTraderService:
             try:
                 await self._process_pending()
                 await self._process_running()
+                await self._process_reports()
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -161,6 +164,47 @@ class AutoTraderService:
         if not open_positions and remaining < per_coin:
             await self.runs.update_status(run_id, "completed")
             await self.events.log(run_id, "info", "Run completed (cash exhausted or cap reached)")
+
+    async def _process_reports(self) -> None:
+        reports = await self.reports.db.fetch(
+            "SELECT * FROM autotrader_reports WHERE status='pending' ORDER BY created_at ASC LIMIT 10"
+        )
+        for rpt in reports:
+            run = await self.runs.get_run(rpt["run_id"])
+            if not run:
+                await self.reports.set_status(rpt["id"], "failed")
+                continue
+            events = await self.events.list_for_period(rpt["run_id"], rpt["period_start"], rpt["period_end"], limit=200, offset=0)
+            summary = self._summarize_events(events)
+            text = self._render_report(run, rpt, summary, events)
+            # Placeholder: In full impl, dispatch via dispatcher to chat/DM
+            logger.info("[AUTOTRADER] Report %s for run %s\n%s", rpt["id"], rpt["run_id"], text)
+            await self.reports.set_status(rpt["id"], "sent")
+
+    def _summarize_events(self, events):
+        buys = [e for e in events if e["event_type"] == "buy"]
+        sells = [e for e in events if e["event_type"] == "sell"]
+        skips = [e for e in events if e["event_type"] == "skip"]
+        alerts = [e for e in events if e["event_type"] == "alert"]
+        return {
+            "buys": len(buys),
+            "sells": len(sells),
+            "skips": len(skips),
+            "alerts": len(alerts),
+        }
+
+    def _render_report(self, run: dict, rpt: dict, summary: dict, events) -> str:
+        lines = [
+            f"AutoTrader Report (Run {rpt['run_id']})",
+            f"Period: {rpt['period_start']} → {rpt['period_end']}",
+            f"Buys: {summary['buys']} | Sells: {summary['sells']} | Skips: {summary['skips']} | Alerts: {summary['alerts']}",
+            "",
+        ]
+        for e in events[:100]:
+            lines.append(f"{e['created_at']}: {e['event_type']} — {e['message']}")
+        if len(events) > 100:
+            lines.append(f"... +{len(events)-100} more")
+        return "\n".join(lines)
 
     async def _meets_stop_rules(self, run: dict, remaining: float) -> bool:
         target_value = run.get("target_value")
