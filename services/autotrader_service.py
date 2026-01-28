@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Optional
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from config import settings
 from models import (
@@ -184,7 +185,7 @@ class AutoTraderService:
         # Liquidity/fee parity with /invest: require liquidity >= 0.1 * mc
         pair = await self.dex.fetch_token(address, chain_id="solana", use_cache=False)
         liq = self.dex.get_liquidity(pair) if pair else None
-        if liq is None or mc is None or liq < (mc * Decimal("0.10")):
+        if liq is None or mc is None or (liq is not None and mc is not None and liq < (mc * Decimal("0.10"))):
             await self.events.log(run_id, "skip", f"Low liquidity for {address[:8]}")
             return False
         qty = spend / price
@@ -193,6 +194,14 @@ class AutoTraderService:
         return True
 
     async def _fetch_fresh_price(self, address: str, max_retries: int, freshness_secs: int):
+        # Try cached first
+        cached = self.dex.get_cached_pair(address, chain_id="solana", freshness_secs=freshness_secs)
+        if cached:
+            price = self.dex.get_price(cached)
+            mc = self.dex.get_market_cap(cached)
+            if price and mc:
+                return price, mc
+
         attempt = 0
         last_data = None
         while attempt < max_retries:
@@ -201,13 +210,11 @@ class AutoTraderService:
             if pair:
                 mc = self.dex.get_market_cap(pair)
                 price = self.dex.get_price(pair)
-                ts = datetime.now(timezone.utc)
-                last_data = (price, mc, ts)
-                # use immediate freshness (just fetched)
+                last_data = (price, mc)
                 if price and mc:
                     return price, mc
             await asyncio.sleep(0.5)
-        return (last_data[0], last_data[1]) if last_data else (None, None)
+        return last_data if last_data else (None, None)
 
     async def _fetch_sell_value(self, pos: dict, max_retries: int, freshness_secs: int):
         token_id = pos["token_id"]

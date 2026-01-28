@@ -108,6 +108,15 @@ class DexScreenerAPIClient:
         )
         return best_pair
 
+    def get_cached_pair(self, address: str, chain_id: str = "solana", freshness_secs: int = 15) -> Optional[Dict[str, Any]]:
+        cache_key = f"{(chain_id or 'solana').lower()}:{address.strip()}"
+        ts = self._cache_timestamps.get(cache_key)
+        if not ts:
+            return None
+        if (datetime.utcnow() - ts).total_seconds() > freshness_secs:
+            return None
+        return self._cache.get(cache_key)
+
     async def fetch_token_pairs(
         self,
         address: str,
