@@ -232,7 +232,6 @@ class Keyboards:
                 InlineKeyboardButton(text="200", callback_data="autotrader:cap:200"),
             ],
             [InlineKeyboardButton(text="🔢 Custom", callback_data="autotrader:cap:custom")],
-            [InlineKeyboardButton(text="⏭️ Skip (use default 100)", callback_data="autotrader:cap:skip")],
         ])
 
     @staticmethod
@@ -240,7 +239,8 @@ class Keyboards:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Target Value", callback_data="autotrader:stop:target")],
             [InlineKeyboardButton(text="💀 Bankrupt Floor", callback_data="autotrader:stop:bankrupt")],
-            [InlineKeyboardButton(text="⏱️ End Time", callback_data="autotrader:stop:endtime")],
+            [InlineKeyboardButton(text="⏱️ Stop After Time", callback_data="autotrader:stop:endtime")],
+            [InlineKeyboardButton(text="💸 Stop at $0", callback_data="autotrader:stop:zero")],
             [InlineKeyboardButton(text="♾️ Run until cap/stop rules", callback_data="autotrader:stop:none")],
         ])
 
