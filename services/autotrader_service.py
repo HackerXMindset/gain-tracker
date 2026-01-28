@@ -13,6 +13,8 @@ from models import (
 )
 from services import get_dexscreener_client
 from models.token import TokenModel
+from models.analytics import AnalyticsModel
+from models.monitored_source import MonitoredSourceModel
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,8 @@ class AutoTraderService:
         self.positions = AutoTraderPositionModel()
         self.token_model = TokenModel()
         self.dex = get_dexscreener_client()
+        self.analytics = AnalyticsModel()
+        self.sources = MonitoredSourceModel()
 
     async def start(self) -> None:
         if self.running:
@@ -144,18 +148,31 @@ class AutoTraderService:
             await self.events.log(run_id, "info", "Run completed (cash exhausted or cap reached)")
 
     async def _pick_fresh_tokens(self, run: dict, limit: int):
-        # Simplified: pick newest active tokens
-        rows = await self.token_model.db.fetch(
-            """
-            SELECT id, address
-            FROM tokens_tracked
-            WHERE status='active'
-            ORDER BY first_seen_at DESC
-            LIMIT $1
-            """,
-            limit,
-        )
-        return rows
+        mode = run.get("channel_mode", "single")
+        channels = run.get("channels") or []
+
+        base_query = """
+            SELECT t.id, t.address
+            FROM tokens_tracked t
+            WHERE t.status='active'
+        """
+        params = []
+        if mode == "single" and channels:
+            base_query += " AND t.first_seen_source = ANY($1)"
+            params.append(channels)
+        elif mode == "multi" and channels:
+            base_query += " AND t.first_seen_source = ANY($1)"
+            params.append(channels)
+        # mode == all -> no filter
+
+        base_query += " ORDER BY t.first_seen_at DESC LIMIT $2"
+
+        if not params:
+            params = [limit]
+            return await self.token_model.db.fetch(base_query, limit)
+        else:
+            params.append(limit)
+            return await self.token_model.db.fetch(base_query, *params)
 
     async def _attempt_buy(self, run_id: int, token: dict, spend: float, max_retries: int, freshness_secs: int) -> bool:
         token_id = token["id"]
@@ -163,6 +180,12 @@ class AutoTraderService:
         price, mc = await self._fetch_fresh_price(address, max_retries, freshness_secs)
         if price is None or mc is None or price <= 0:
             await self.events.log(run_id, "skip", f"Stale or missing price for {address[:8]}")
+            return False
+        # Liquidity/fee parity with /invest: require liquidity >= 0.1 * mc
+        pair = await self.dex.fetch_token(address, chain_id="solana", use_cache=False)
+        liq = self.dex.get_liquidity(pair) if pair else None
+        if liq is None or mc is None or liq < (mc * Decimal("0.10")):
+            await self.events.log(run_id, "skip", f"Low liquidity for {address[:8]}")
             return False
         qty = spend / price
         await self.positions.create_position(run_id, token_id, spend, price, mc, qty)
