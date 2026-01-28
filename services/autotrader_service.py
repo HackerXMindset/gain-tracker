@@ -27,7 +27,7 @@ class AutoTraderService:
     Phase 3/4 engine will plug real trading here; for now we transition runs and log.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, management_bot=None) -> None:
         self.running = False
         self._task: Optional[asyncio.Task] = None
         self.runs = AutoTraderRunModel()
@@ -38,6 +38,7 @@ class AutoTraderService:
         self.dex = get_dexscreener_client()
         self.analytics = AnalyticsModel()
         self.sources = MonitoredSourceModel()
+        self.management_bot = management_bot
 
     async def start(self) -> None:
         if self.running:
@@ -177,9 +178,12 @@ class AutoTraderService:
             events = await self.events.list_for_period(rpt["run_id"], rpt["period_start"], rpt["period_end"], limit=200, offset=0)
             summary = self._summarize_events(events)
             text = self._render_report(run, rpt, summary, events)
-            # Placeholder: In full impl, dispatch via dispatcher to chat/DM
-            logger.info("[AUTOTRADER] Report %s for run %s\n%s", rpt["id"], rpt["run_id"], text)
-            await self.reports.set_status(rpt["id"], "sent")
+            if run.get("destination_chat_id") and self.management_bot:
+                await self.management_bot.send_message(run["destination_chat_id"], text)
+                await self.reports.set_status(rpt["id"], "sent")
+            else:
+                logger.info("[AUTOTRADER] Report %s for run %s\n%s", rpt["id"], rpt["run_id"], text)
+                await self.reports.set_status(rpt["id"], "sent")
 
     def _summarize_events(self, events):
         buys = [e for e in events if e["event_type"] == "buy"]

@@ -87,7 +87,7 @@ async def run() -> None:
 
         if settings.enable_autotrader:
             from services.autotrader_service import AutoTraderService
-            autotrader_service = AutoTraderService()
+            autotrader_service = AutoTraderService(management_bot=management_bot)
             await autotrader_service.start()
             services_started["autotrader"] = True
 
