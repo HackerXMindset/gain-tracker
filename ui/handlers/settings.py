@@ -306,6 +306,30 @@ class SettingsHandler:
             await query.message.edit_text("Hold time in minutes (e.g., 60):")
         await query.answer()
 
+    async def autotrader_custom_budget(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            budget = float(message.text.replace(",", ""))
+            if budget <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for budget (e.g., 10000).")
+            return
+        await state.update_data(budget_total=budget, remaining_cash=budget)
+        await state.set_state(AutoTraderStates.awaiting_per_coin)
+        await message.answer("Per-coin spend (USD):", reply_markup=self.keyboards.autotrader_per_coin())
+
+    async def autotrader_custom_per_coin(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            per_coin = float(message.text.replace(",", ""))
+            if per_coin <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for per-coin spend.")
+            return
+        await state.update_data(per_coin_spend=per_coin)
+        await state.set_state(AutoTraderStates.awaiting_hold)
+        await message.answer("Hold time in minutes (e.g., 60):")
+
     async def autotrader_get_per_coin(self, message: types.Message, state: FSMContext) -> None:
         try:
             per_coin = float(message.text.replace(",", ""))
@@ -346,6 +370,35 @@ class SettingsHandler:
         await state.set_state(AutoTraderStates.awaiting_stop_choice)
         await message.answer("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
 
+    async def autotrader_coin_cap_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_coin_cap)
+            await query.message.edit_text("Enter coin cap (positive integer):")
+        elif val == "skip":
+            cap = settings.autotrader_default_coin_cap
+            await state.update_data(coin_cap=cap)
+            await state.set_state(AutoTraderStates.awaiting_stop_choice)
+            await query.message.edit_text("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+        else:
+            cap = int(val)
+            await state.update_data(coin_cap=cap)
+            await state.set_state(AutoTraderStates.awaiting_stop_choice)
+            await query.message.edit_text("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+        await query.answer()
+
+    async def autotrader_custom_coin_cap(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            cap = int(message.text.strip())
+            if cap <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive integer for coin cap.")
+            return
+        await state.update_data(coin_cap=cap)
+        await state.set_state(AutoTraderStates.awaiting_stop_choice)
+        await message.answer("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+
     async def autotrader_stop_choice(self, query: types.CallbackQuery, state: FSMContext) -> None:
         choice = query.data.split(":")[-1]
         if choice == "target":
@@ -356,7 +409,7 @@ class SettingsHandler:
             await query.message.edit_text("Enter bankrupt floor in USD (e.g., 500):")
         elif choice == "endtime":
             await state.set_state(AutoTraderStates.awaiting_channel_mode)
-            await query.message.edit_text("End time not implemented; continuing. Choose channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+            await query.message.edit_text("End time stop rule not yet implemented; continuing. Choose channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
         else:
             await state.set_state(AutoTraderStates.awaiting_channel_mode)
             await query.message.edit_text("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
