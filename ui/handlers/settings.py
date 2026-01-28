@@ -320,6 +320,46 @@ class SettingsHandler:
                 await message.answer("Enter a positive integer or 'skip'.")
                 return
         await state.update_data(coin_cap=cap)
+        await state.set_state(AutoTraderStates.awaiting_stop_choice)
+        await message.answer("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+
+    async def autotrader_stop_choice(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        choice = query.data.split(":")[-1]
+        if choice == "target":
+            await state.set_state(AutoTraderStates.awaiting_target_value)
+            await query.message.edit_text("Enter target portfolio value in USD (e.g., 20000):")
+        elif choice == "bankrupt":
+            await state.set_state(AutoTraderStates.awaiting_bankrupt_floor)
+            await query.message.edit_text("Enter bankrupt floor in USD (e.g., 500):")
+        elif choice == "endtime":
+            await state.set_state(AutoTraderStates.awaiting_channel_mode)
+            await query.message.edit_text("End time not implemented; continuing. Choose channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+        else:
+            await state.set_state(AutoTraderStates.awaiting_channel_mode)
+            await query.message.edit_text("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+        await query.answer()
+
+    async def autotrader_target_value(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            val = float(message.text.replace(",", ""))
+            if val <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for target value.")
+            return
+        await state.update_data(target_value=val)
+        await state.set_state(AutoTraderStates.awaiting_channel_mode)
+        await message.answer("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+
+    async def autotrader_bankrupt_floor(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            val = float(message.text.replace(",", ""))
+            if val <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for bankrupt floor.")
+            return
+        await state.update_data(bankrupt_floor=val)
         await state.set_state(AutoTraderStates.awaiting_channel_mode)
         await message.answer("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
 
@@ -384,8 +424,8 @@ class SettingsHandler:
                 "hold_seconds": hold_seconds,
                 "report_interval_seconds": interval,
                 "breakout_multiple": None,
-                "bankrupt_floor": None,
-                "target_value": None,
+                "bankrupt_floor": data.get("bankrupt_floor"),
+                "target_value": data.get("target_value"),
                 "channel_mode": channel_mode,
                 "channels": channels if channels else None,
                 "freshness_secs": settings.autotrader_freshness_secs,

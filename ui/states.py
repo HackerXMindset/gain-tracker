@@ -55,6 +55,9 @@ class AutoTraderStates(StatesGroup):
     awaiting_channels = State()
     awaiting_report_interval = State()
     awaiting_custom_interval = State()
+    awaiting_stop_choice = State()
+    awaiting_target_value = State()
+    awaiting_bankrupt_floor = State()
 
 class ManagementStates(StatesGroup):
     cmd_fwd_add_rule_source_group = State()

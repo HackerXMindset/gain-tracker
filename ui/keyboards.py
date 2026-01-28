@@ -212,6 +212,15 @@ class Keyboards:
         ])
 
     @staticmethod
+    def autotrader_stop_rules() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Target Value", callback_data="autotrader:stop:target")],
+            [InlineKeyboardButton(text="💀 Bankrupt Floor", callback_data="autotrader:stop:bankrupt")],
+            [InlineKeyboardButton(text="⏱️ End Time", callback_data="autotrader:stop:endtime")],
+            [InlineKeyboardButton(text="♾️ Run until cap/stop rules", callback_data="autotrader:stop:none")],
+        ])
+
+    @staticmethod
     def autotrader_channel_mode() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
             [
