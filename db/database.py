@@ -126,7 +126,7 @@ class Database:
             logger.warning("Migrations directory missing: %s", migrations_dir)
             return
 
-        migration_files = sorted(migrations_dir.glob("*.sql"))
+        migration_files = sorted(migrations_dir.glob("*.sql"), key=lambda p: p.name)
         if not migration_files:
             logger.info("No migrations found in %s", migrations_dir)
             return

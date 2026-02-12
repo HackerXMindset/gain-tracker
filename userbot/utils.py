@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 class UserbotUtils:
     def __init__(self) -> None:
         self.solana_pattern = re.compile(settings.solana_pattern)
-        self.bnb_pattern = re.compile(settings.bnb_pattern)
+        # BSC/0x detection disabled (bot is SOL-only for this deployment).
+        self.bnb_pattern = None
 
     def extract_solana_addresses(self, text: str) -> List[str]:
         if not text:
@@ -20,26 +21,26 @@ class UserbotUtils:
         return list(set(self.solana_pattern.findall(text)))
 
     def extract_bnb_addresses(self, text: str) -> List[str]:
-        if not text:
-            return []
-        match = self.bnb_pattern.search(text)
-        if match:
-            return [match.group(0)]
         return []
 
     def extract_token_addresses(self, text: str) -> List[Tuple[str, str]]:
         if not text:
             return []
         sol_addresses = self.extract_solana_addresses(text)
-        bnb_addresses = self.extract_bnb_addresses(text)
 
         tagged = [(addr, "SOL") for addr in sol_addresses]
-        tagged.extend((addr, "BNB") for addr in bnb_addresses)
         return tagged
 
     def get_message_text(self, message) -> str:
-        if hasattr(message, "text") and message.text:
-            return str(message.text)
+        """Return any textual content (message body or caption)."""
+        if not message:
+            return ""
+
+        for attr in ("message", "raw_text", "text", "caption"):
+            val = getattr(message, attr, None)
+            if val:
+                return str(val)
+
         return ""
 
     def get_chat_title(self, chat) -> str:

@@ -8,6 +8,7 @@ import logging
 import re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -15,18 +16,25 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, BotCommand
 
 from alerts.templates import DEFAULT_GAIN_ALERT_TEMPLATE, missing_required_placeholders
 from config import settings
 from db import db
 from models import MonitoredSourceModel, SettingsModel, TokenModel
 from ui.handlers import GainAlertsHandler, SettingsHandler, UserbotsHandler
+from ui.handlers.analytics_commands import AnalyticsCommandsHandler
+from ui.handlers.info import InfoHandler
+from ui.handlers.invest import InvestHandler
 from ui.keyboards import Keyboards
+from ui.routers.invest import get_invest_router
 from ui.routers.registry import get_router_factories
+from ui.handlers.command_forwarding import CommandForwardingHandler
 from utils.logging_setup import configure_logging
 from utils.tier_calculator import calculate_next_poll_time, format_duration, get_poll_interval_for_tier
 from scheduler.dex_service import DexService, get_dex_service
+from services.dexscreener_api import get_dexscreener_client
+from models.analytics import AnalyticsModel
 
 logger = logging.getLogger(__name__)
 
@@ -44,16 +52,22 @@ async def run_admin_bot() -> None:
     )
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
+    logger.info("Admin bot online. Admin IDs: %s", settings.admin_telegram_ids_list)
 
     keyboards = Keyboards()
     token_model = TokenModel(db)
     settings_model = SettingsModel(db)
     source_model = MonitoredSourceModel(db)
+    analytics_model = AnalyticsModel(db)
+    dexscreener_api = get_dexscreener_client()
     sol_pattern = re.compile(settings.solana_pattern)
     bnb_pattern = re.compile(settings.bnb_pattern, re.IGNORECASE)
 
     async def cmd_menu(message: types.Message) -> None:
-        if message.from_user.id not in settings.admin_telegram_ids_list:
+        user_id = message.from_user.id if message.from_user else None
+        logger.info("[ADMIN_MENU] /menu from user %s (admins=%s)", user_id, settings.admin_telegram_ids_list)
+        if user_id not in settings.admin_telegram_ids_list:
+            logger.info("[ADMIN_MENU] User %s not authorized for /menu", user_id)
             return
         await message.answer(
             "<b>🎛 Gain Alert Console</b>\n\nSelect an option:",
@@ -61,6 +75,8 @@ async def run_admin_bot() -> None:
         )
 
     async def show_menu(query: types.CallbackQuery) -> None:
+        user_id = query.from_user.id if query.from_user else None
+        logger.info("[ADMIN_MENU] menu callback from user %s", user_id)
         await query.message.edit_text(
             "<b>🎛 Gain Alert Console</b>\n\nSelect an option:",
             reply_markup=keyboards.main_menu(),
@@ -100,11 +116,24 @@ async def run_admin_bot() -> None:
             return "N/A"
         return DexService._format_mc_shorthand(decimal_value)
 
+    async def _compute_tracking_until(first_seen_at) -> Optional[datetime]:
+        max_hold_seconds = await analytics_model.get_max_hold_seconds()
+        if not max_hold_seconds:
+            return None
+        base_time = first_seen_at or datetime.now(timezone.utc)
+        if base_time.tzinfo is None:
+            base_time = base_time.replace(tzinfo=timezone.utc)
+        tracking_until = base_time + timedelta(seconds=max_hold_seconds)
+        if tracking_until <= datetime.now(timezone.utc):
+            return None
+        return tracking_until
+
     async def cmd_all_commands(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
             return
 
         await message.answer(
+            "<b>Gain alert:</b>\n"
             "📚 <b>Available Gain Alert Commands</b>\n\n"
 
             "🔍 <b>Token Inspector</b>\n"
@@ -115,31 +144,35 @@ async def run_admin_bot() -> None:
             "<code>/tri &lt;chat_id&gt; &lt;ca&gt; [p] [c]</code> - To specific chat\n"
             "Flags: <code>p</code>=peak MC, <code>c</code>=include chart\n\n"
 
+            "📊 <b>Analytics</b>\n"
+            "<code>/stats &lt;chat_id&gt; [period]</code> - Performance stats\n"
+            "<code>/top [period]</code> - Leaderboard of best sources\n"
+            "<code>/patterns &lt;chat_id&gt;</code> - Time pattern analysis\n"
+            "<code>/besthold [chat_id] [period]</code> - Best hold duration\n"
+            "<code>/invest &lt;amount&gt;</code> - Simulate investment P&L\n"
+            "<code>/info &lt;chat_id&gt;|user:&lt;user_id&gt;|@username</code> - DB info & stats\n\n"
+
+            "⏱ <b>Timeframes</b>\n"
+            "<code>/timeframes</code> - List all hold durations\n"
+            "<code>/addtimeframe &lt;label&gt; &lt;sec&gt; [def]</code> - Add new\n"
+            "<code>/deltimeframe &lt;label&gt;</code> - Remove\n\n"
+
             "🔄 <b>Restart Monitoring</b>\n"
-            "<code>/str &lt;ca&gt; [tier]</code> - Restart stopped token\n"
-            "Tiers: tier_a (10s) to tier_f (30min)\n\n"
+            "<code>/str &lt;ca&gt; [tier]</code> - Restart stopped token\n\n"
 
             "⛔ <b>Stop Monitoring</b>\n"
             "<code>/stop &lt;ca&gt;</code> - Stop tracking token\n\n"
 
+            "⏸ <b>Pause Gain Alerts</b>\n"
+            "<code>/stop_ca</code> - Pause alerts for all sources\n"
+            "<code>/stop_ca &lt;chat_id&gt;</code> - Pause alerts for one chat/channel\n\n"
+            "▶️ <b>Resume Gain Alerts</b>\n"
+            "<code>/start_ca</code> - Resume alerts for all sources\n"
+            "<code>/start_ca &lt;chat_id&gt;</code> - Resume alerts for one chat/channel\n\n"
+
             "🎛 <b>Management</b>\n"
             "<code>/menu</code> or <code>/start</code> - Show main menu\n"
-            "<code>/all</code> - Show this command list\n\n"
-
-            "🧹 <b>Danger Zone</b>\n"
-            "<code>/clean_ca confirm</code> - Wipe every tracked contract address\n\n"
-
-            "📖 <b>Examples:</b>\n"
-            "• <code>/i HnKk7xPZmL...</code>\n"
-            "• <code>/tri HnKk7... p c</code>\n"
-            "• <code>/tri -1001234567890 HnKk7... c</code>\n"
-            "• <code>/str HnKk7... tier_c</code>\n"
-            "• <code>/stop HnKk7...</code>\n\n"
-
-            "💡 <b>Tips:</b>\n"
-            "• CA = Contract Address\n"
-            "• Use <code>/command</code> without args to see detailed help\n"
-            "• Commands support Solana & BNB tokens",
+            "<code>/all</code> - Show this command list",
             parse_mode="HTML",
         )
 
@@ -347,7 +380,8 @@ async def run_admin_bot() -> None:
             )
             return
 
-        await token_model.set_status(token_id, "stopped")
+        tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+        await token_model.set_status(token_id, "stopped", tracking_until)
         await token_model.set_stop_reason(token_id, "admin_manual_stop")
 
         ticker = token.get("ticker") or raw_address[:8]
@@ -358,6 +392,179 @@ async def run_admin_bot() -> None:
             f"Reason: admin_manual_stop",
             parse_mode="HTML",
         )
+
+    async def cmd_stop_ca(message: types.Message) -> None:
+        if message.from_user.id not in settings.admin_telegram_ids_list:
+            return
+
+        parts = (message.text or "").split()
+        if len(parts) == 1:
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
+            result = await db.execute(
+                """
+                UPDATE tokens_tracked
+                SET status = 'stopped',
+                    stop_reason = 'admin_ca_stop_all',
+                    tracking_until = CASE
+                        WHEN $1::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($1::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($1::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
+                WHERE status != 'stopped'
+                """
+                ,
+                max_hold_seconds,
+            )
+            count = int(result.split()[-1]) if result.startswith("UPDATE") else 0
+            await message.answer(f"⛔ Stopped monitoring all contracts ({count} updated).", parse_mode="HTML")
+            return
+
+        raw_arg = parts[1].strip()
+
+        # If numeric, treat as chat ID to stop all contracts associated with that chat
+        try:
+            chat_id_arg = int(raw_arg)
+            token_rows = await db.fetch(
+                """
+                SELECT DISTINCT token_id
+                FROM token_group_alerts
+                WHERE chat_id = $1
+                """,
+                chat_id_arg,
+            )
+            if not token_rows:
+                await message.answer(f"❌ No contracts found for chat <code>{chat_id_arg}</code>.", parse_mode="HTML")
+                return
+            token_ids = [row["token_id"] for row in token_rows]
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
+            await db.execute(
+                """
+                UPDATE tokens_tracked
+                SET status = 'stopped',
+                    stop_reason = 'admin_ca_stop_chat',
+                    tracking_until = CASE
+                        WHEN $2::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($2::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($2::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
+                WHERE id = ANY($1::BIGINT[])
+                """,
+                token_ids,
+                max_hold_seconds,
+            )
+            await message.answer(
+                f"⛔ Stopped monitoring {len(token_ids)} contract(s) for chat <code>{chat_id_arg}</code>.",
+                parse_mode="HTML",
+            )
+            return
+        except ValueError:
+            pass
+
+        # Otherwise treat all remaining args as contract addresses
+        addresses = parts[1:]
+        stopped = 0
+        not_found: list[str] = []
+        invalid: list[str] = []
+
+        for raw_address in addresses:
+            address = raw_address.strip()
+            chain = _detect_chain(address)
+            if chain is None:
+                invalid.append(address)
+                continue
+
+            token = await token_model.get_by_address(address)
+            if not token:
+                not_found.append(address)
+                continue
+
+            tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+            await token_model.set_status(token["id"], "stopped", tracking_until)
+            await token_model.set_stop_reason(token["id"], "admin_ca_stop")
+            stopped += 1
+
+        lines = []
+        if stopped:
+            lines.append(f"✅ Stopped monitoring {stopped} contract(s).")
+        if not_found:
+            lines.append("❌ Not found: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in not_found))
+        if invalid:
+            lines.append("⚠️ Invalid address format: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in invalid))
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+    async def cmd_start_ca(message: types.Message) -> None:
+        if message.from_user.id not in settings.admin_telegram_ids_list:
+            return
+
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.answer(
+                "✅ <b>Resume Token Monitoring</b>\n\n"
+                "Usage:\n"
+                "<code>/start_ca &lt;contract_address&gt; [tier]</code>\n\n"
+                "Tier optional (a-f).",
+                parse_mode="HTML",
+            )
+            return
+
+        addresses = [parts[1].strip()]
+        tier_arg = parts[2].strip().lower() if len(parts) >= 3 else None
+
+        restarted = 0
+        invalid = []
+        not_found = []
+        bad_tier = False
+
+        valid_tiers = {"tier_a", "tier_b", "tier_c", "tier_d", "tier_e", "tier_f", "a", "b", "c", "d", "e", "f"}
+        if tier_arg and tier_arg not in valid_tiers:
+            bad_tier = True
+
+        for raw_address in addresses:
+            chain = _detect_chain(raw_address)
+            if chain is None:
+                invalid.append(raw_address)
+                continue
+
+            token = await token_model.get_by_address(raw_address)
+            if not token:
+                not_found.append(raw_address)
+                continue
+
+            token_id = token["id"]
+
+            if bad_tier:
+                continue
+
+            if tier_arg:
+                tier = f"tier_{tier_arg}" if len(tier_arg) == 1 else tier_arg
+                poll_seconds = get_poll_interval_for_tier(tier)
+                next_poll = datetime.now(timezone.utc) + timedelta(seconds=poll_seconds)
+            else:
+                first_seen_at = token.get("first_seen_at") or datetime.now(timezone.utc)
+                tier, next_poll = calculate_next_poll_time(first_seen_at)
+
+            await token_model.set_status(token_id, "active")
+            await token_model.set_stop_reason(token_id, None)
+            await token_model.update_tier(token_id, tier, next_poll)
+            restarted += 1
+
+        lines = []
+        if restarted:
+            lines.append(f"✅ Resumed monitoring {restarted} contract(s).")
+        if bad_tier:
+            lines.append("⚠️ Invalid tier. Use a-f (or tier_a..tier_f).")
+        if not_found:
+            lines.append("❌ Not found: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in not_found))
+        if invalid:
+            lines.append("⚠️ Invalid address format: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in invalid))
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
 
     async def cmd_clean_contracts(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
@@ -374,8 +581,16 @@ async def run_admin_bot() -> None:
             )
             return
 
-        await db.execute("DELETE FROM tokens_tracked")
-        await message.answer("✅ All tracked contract addresses have been wiped.", parse_mode="HTML")
+        await db.execute("TRUNCATE tokens_tracked CASCADE")
+        await db.execute("TRUNCATE timeframe_snapshot_attempts RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_daily RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_hourly RESTART IDENTITY")
+        await message.answer(
+            "✅ All tracked contract addresses have been wiped.\n"
+            "✅ Snapshot reasons and API check metrics cleared.",
+            parse_mode="HTML",
+        )
 
     async def cmd_trigger(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
@@ -711,6 +926,10 @@ async def run_admin_bot() -> None:
     gain_alerts_handler = GainAlertsHandler(db)
     settings_handler = SettingsHandler(db, keyboards)
     userbots_handler = UserbotsHandler(db, keyboards)
+    cmd_fwd_handler = CommandForwardingHandler(db, keyboards)
+    analytics_handler = AnalyticsCommandsHandler(db)
+    info_handler = InfoHandler()
+    invest_handler = InvestHandler(analytics_model, dexscreener_api, source_model)
 
     async def show_settings(query: types.CallbackQuery) -> None:
         await settings_handler.show_settings_menu(query)
@@ -721,8 +940,11 @@ async def run_admin_bot() -> None:
         F.from_user.id.in_(settings.admin_telegram_ids_list),
     )
 
-    for register_factory in get_router_factories(gain_alerts_handler, userbots_handler, settings_handler):
+    for register_factory in get_router_factories(gain_alerts_handler, userbots_handler, settings_handler, cmd_fwd_handler):
         register_factory(dp)
+
+    invest_router = get_invest_router(invest_handler, settings)
+    dp.include_router(invest_router)
 
     dp.message.register(
         cmd_all_commands,
@@ -745,6 +967,16 @@ async def run_admin_bot() -> None:
         F.from_user.id.in_(settings.admin_telegram_ids_list),
     )
     dp.message.register(
+        cmd_stop_ca,
+        Command(commands=["stop_ca"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        cmd_start_ca,
+        Command(commands=["start_ca"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
         cmd_clean_contracts,
         Command(commands=["clean_ca", "wipe_ca"]),
         F.from_user.id.in_(settings.admin_telegram_ids_list),
@@ -755,8 +987,72 @@ async def run_admin_bot() -> None:
         F.from_user.id.in_(settings.admin_telegram_ids_list),
     )
 
+    # Analytics commands
+    dp.message.register(
+        analytics_handler.cmd_stats,
+        Command(commands=["stats"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        analytics_handler.cmd_top,
+        Command(commands=["top", "leaderboard"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        analytics_handler.cmd_patterns,
+        Command(commands=["patterns"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        analytics_handler.cmd_besthold,
+        Command(commands=["besthold"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        info_handler.cmd_info,
+        Command(commands=["info", "whois", "chatinfo"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.callback_query.register(
+        analytics_handler.handle_timezone_selection,
+        F.data.startswith("patterns:tz:"),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        settings_handler.cmd_timeframes,
+        Command(commands=["timeframes"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        settings_handler.cmd_add_timeframe,
+        Command(commands=["addtimeframe"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(
+        settings_handler.cmd_del_timeframe,
+        Command(commands=["deltimeframe"]),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Starting admin bot polling")
+    await bot.set_my_commands([
+        BotCommand(command="i", description="Inspect token details"),
+        BotCommand(command="tri", description="Force gain alert"),
+        BotCommand(command="str", description="Restart stopped token"),
+        BotCommand(command="stop", description="Stop tracking token"),
+        BotCommand(command="stop_ca", description="Stop CA tracking"),
+        BotCommand(command="start_ca", description="Resume CA tracking"),
+        BotCommand(command="stats", description="Performance stats"),
+        BotCommand(command="top", description="Leaderboard"),
+        BotCommand(command="patterns", description="Time pattern analysis"),
+        BotCommand(command="besthold", description="Best hold duration"),
+        BotCommand(command="invest", description="Investment simulator"),
+        BotCommand(command="info", description="DB info"),
+        BotCommand(command="whois", description="DB info"),
+        BotCommand(command="timeframes", description="Hold durations"),
+        BotCommand(command="menu", description="Show main menu"),
+        BotCommand(command="all", description="Show all commands"),
+    ])
     await dp.start_polling(bot)
 
 
@@ -771,6 +1067,7 @@ async def create_admin_dispatcher() -> None:
     )
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
+    logger.info("Admin bot online (integrated). Admin IDs: %s", settings.admin_telegram_ids_list)
 
     keyboards = Keyboards()
     token_model = TokenModel(db)
@@ -806,7 +1103,10 @@ async def create_admin_dispatcher() -> None:
         return DexService._format_mc_shorthand(decimal_value)
 
     async def cmd_menu(message: types.Message) -> None:
-        if message.from_user.id not in settings.admin_telegram_ids_list:
+        user_id = message.from_user.id if message.from_user else None
+        logger.info("[ADMIN_MENU] /menu from user %s (admins=%s)", user_id, settings.admin_telegram_ids_list)
+        if user_id not in settings.admin_telegram_ids_list:
+            logger.info("[ADMIN_MENU] User %s not authorized for /menu", user_id)
             return
         await message.answer(
             "<b>🎛 Gain Alert Console</b>\n\nSelect an option:",
@@ -814,6 +1114,8 @@ async def create_admin_dispatcher() -> None:
         )
 
     async def show_menu(query: types.CallbackQuery) -> None:
+        user_id = query.from_user.id if query.from_user else None
+        logger.info("[ADMIN_MENU] menu callback from user %s", user_id)
         await query.message.edit_text(
             "<b>🎛 Gain Alert Console</b>\n\nSelect an option:",
             reply_markup=keyboards.main_menu(),
@@ -831,17 +1133,43 @@ async def create_admin_dispatcher() -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
             return
         await message.answer(
+            "<b>Gain alert:</b>\n"
             "📚 <b>Available Gain Alert Commands</b>\n\n"
+
             "🔍 <b>Token Inspector</b>\n"
             "<code>/i &lt;ca&gt;</code> - Inspect token details\n\n"
+
             "🎯 <b>Trigger Gain Alert</b>\n"
             "<code>/tri &lt;ca&gt; [p] [c]</code> - Force gain alert\n"
             "<code>/tri &lt;chat_id&gt; &lt;ca&gt; [p] [c]</code> - To specific chat\n"
             "Flags: <code>p</code>=peak MC, <code>c</code>=include chart\n\n"
+
+            "📊 <b>Analytics</b>\n"
+            "<code>/stats &lt;chat_id&gt; [period]</code> - Performance stats\n"
+            "<code>/top [period]</code> - Leaderboard of best sources\n"
+            "<code>/patterns &lt;chat_id&gt;</code> - Time pattern analysis\n"
+            "<code>/besthold [chat_id] [period]</code> - Best hold duration\n"
+            "<code>/invest &lt;amount&gt;</code> - Simulate investment P&L\n"
+            "<code>/info &lt;chat_id&gt;|user:&lt;user_id&gt;|@username</code> - DB info & stats\n\n"
+
+            "⏱ <b>Timeframes</b>\n"
+            "<code>/timeframes</code> - List all hold durations\n"
+            "<code>/addtimeframe &lt;label&gt; &lt;sec&gt; [def]</code> - Add new\n"
+            "<code>/deltimeframe &lt;label&gt;</code> - Remove\n\n"
+
             "🔄 <b>Restart Monitoring</b>\n"
             "<code>/str &lt;ca&gt; [tier]</code> - Restart stopped token\n\n"
+
             "⛔ <b>Stop Monitoring</b>\n"
             "<code>/stop &lt;ca&gt;</code> - Stop tracking token\n\n"
+
+            "⛔ <b>Stop Token Monitoring</b>\n"
+            "<code>/stop_ca</code> - Stop monitoring ALL contract addresses\n"
+            "<code>/stop_ca &lt;chat_id&gt;</code> - Stop monitoring all contracts from that chat/channel\n"
+            "<code>/stop_ca &lt;ca&gt; [&lt;ca&gt;...]</code> - Stop specific contract address(es)\n\n"
+            "✅ <b>Resume Token Monitoring</b>\n"
+            "<code>/start_ca &lt;ca&gt; [tier]</code> - Resume monitoring a contract address (tier optional)\n\n"
+
             "🎛 <b>Management</b>\n"
             "<code>/menu</code> or <code>/start</code> - Show main menu\n"
             "<code>/all</code> - Show this command list",
@@ -924,9 +1252,183 @@ async def create_admin_dispatcher() -> None:
         if not token:
             await message.answer(f"❌ Token not found", parse_mode="HTML")
             return
-        await token_model.set_status(token["id"], "stopped")
+        tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+        await token_model.set_status(token["id"], "stopped", tracking_until)
         await token_model.set_stop_reason(token["id"], "admin_manual_stop")
         await message.answer(f"✅ Stopped {token.get('ticker') or raw_address[:8]}", parse_mode="HTML")
+
+    async def cmd_stop_ca(message: types.Message) -> None:
+        if message.from_user.id not in settings.admin_telegram_ids_list:
+            return
+
+        parts = (message.text or "").split()
+        if len(parts) == 1:
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
+            result = await db.execute(
+                """
+                UPDATE tokens_tracked
+                SET status = 'stopped',
+                    stop_reason = 'admin_ca_stop_all',
+                    tracking_until = CASE
+                        WHEN $1::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($1::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($1::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
+                WHERE status != 'stopped'
+                """
+                ,
+                max_hold_seconds,
+            )
+            count = int(result.split()[-1]) if result.startswith("UPDATE") else 0
+            await message.answer(f"⛔ Stopped monitoring all contracts ({count} updated).", parse_mode="HTML")
+            return
+
+        raw_arg = parts[1].strip()
+
+        # If numeric, treat as chat ID to stop all contracts associated with that chat
+        try:
+            chat_id_arg = int(raw_arg)
+            token_rows = await db.fetch(
+                """
+                SELECT DISTINCT token_id
+                FROM token_group_alerts
+                WHERE chat_id = $1
+                """,
+                chat_id_arg,
+            )
+            if not token_rows:
+                await message.answer(f"❌ No contracts found for chat <code>{chat_id_arg}</code>.", parse_mode="HTML")
+                return
+            token_ids = [row["token_id"] for row in token_rows]
+            max_hold_seconds = await analytics_model.get_max_hold_seconds()
+            await db.execute(
+                """
+                UPDATE tokens_tracked
+                SET status = 'stopped',
+                    stop_reason = 'admin_ca_stop_chat',
+                    tracking_until = CASE
+                        WHEN $2::int > 0
+                         AND first_seen_at IS NOT NULL
+                         AND first_seen_at + ($2::int * INTERVAL '1 second') > NOW()
+                        THEN first_seen_at + ($2::int * INTERVAL '1 second')
+                        ELSE NULL
+                    END
+                WHERE id = ANY($1::BIGINT[])
+                """,
+                token_ids,
+                max_hold_seconds,
+            )
+            await message.answer(
+                f"⛔ Stopped monitoring {len(token_ids)} contract(s) for chat <code>{chat_id_arg}</code>.",
+                parse_mode="HTML",
+            )
+            return
+        except ValueError:
+            pass
+
+        # Otherwise treat all remaining args as contract addresses
+        addresses = parts[1:]
+        stopped = 0
+        not_found: list[str] = []
+        invalid: list[str] = []
+
+        for raw_address in addresses:
+            address = raw_address.strip()
+            chain = _detect_chain(address)
+            if chain is None:
+                invalid.append(address)
+                continue
+
+            token = await token_model.get_by_address(address)
+            if not token:
+                not_found.append(address)
+                continue
+
+            tracking_until = await _compute_tracking_until(token.get("first_seen_at"))
+            await token_model.set_status(token["id"], "stopped", tracking_until)
+            await token_model.set_stop_reason(token["id"], "admin_ca_stop")
+            stopped += 1
+
+        lines = []
+        if stopped:
+            lines.append(f"✅ Stopped monitoring {stopped} contract(s).")
+        if not_found:
+            lines.append("❌ Not found: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in not_found))
+        if invalid:
+            lines.append("⚠️ Invalid address format: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in invalid))
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+    async def cmd_start_ca(message: types.Message) -> None:
+        if message.from_user.id not in settings.admin_telegram_ids_list:
+            return
+
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.answer(
+                "✅ <b>Resume Token Monitoring</b>\n\n"
+                "Usage:\n"
+                "<code>/start_ca &lt;contract_address&gt; [tier]</code>\n\n"
+                "Tier optional (a-f).",
+                parse_mode="HTML",
+            )
+            return
+
+        addresses = [parts[1].strip()]
+        tier_arg = parts[2].strip().lower() if len(parts) >= 3 else None
+
+        restarted = 0
+        invalid = []
+        not_found = []
+        bad_tier = False
+
+        valid_tiers = {"tier_a", "tier_b", "tier_c", "tier_d", "tier_e", "tier_f", "a", "b", "c", "d", "e", "f"}
+        if tier_arg and tier_arg not in valid_tiers:
+            bad_tier = True
+
+        for raw_address in addresses:
+            chain = _detect_chain(raw_address)
+            if chain is None:
+                invalid.append(raw_address)
+                continue
+
+            token = await token_model.get_by_address(raw_address)
+            if not token:
+                not_found.append(raw_address)
+                continue
+
+            token_id = token["id"]
+
+            if bad_tier:
+                continue
+
+            if tier_arg:
+                tier = f"tier_{tier_arg}" if len(tier_arg) == 1 else tier_arg
+                poll_seconds = get_poll_interval_for_tier(tier)
+                next_poll = datetime.now(timezone.utc) + timedelta(seconds=poll_seconds)
+            else:
+                first_seen_at = token.get("first_seen_at") or datetime.now(timezone.utc)
+                tier, next_poll = calculate_next_poll_time(first_seen_at)
+
+            await token_model.set_status(token_id, "active")
+            await token_model.set_stop_reason(token_id, None)
+            await token_model.update_tier(token_id, tier, next_poll)
+            restarted += 1
+
+        lines = []
+        if restarted:
+            lines.append(f"✅ Resumed monitoring {restarted} contract(s).")
+        if bad_tier:
+            lines.append("⚠️ Invalid tier. Use a-f (or tier_a..tier_f).")
+        if not_found:
+            lines.append("❌ Not found: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in not_found))
+        if invalid:
+            lines.append("⚠️ Invalid address format: " + ", ".join(f"<code>{html.escape(a)}</code>" for a in invalid))
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
 
     async def cmd_clean_contracts(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
@@ -943,8 +1445,16 @@ async def create_admin_dispatcher() -> None:
             )
             return
 
-        await db.execute("DELETE FROM tokens_tracked")
-        await message.answer("✅ All tracked contract addresses have been wiped.", parse_mode="HTML")
+        await db.execute("TRUNCATE tokens_tracked CASCADE")
+        await db.execute("TRUNCATE timeframe_snapshot_attempts RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_daily RESTART IDENTITY")
+        await db.execute("TRUNCATE api_request_metrics_hourly RESTART IDENTITY")
+        await message.answer(
+            "✅ All tracked contract addresses have been wiped.\n"
+            "✅ Snapshot reasons and API check metrics cleared.",
+            parse_mode="HTML",
+        )
 
     async def cmd_trigger(message: types.Message) -> None:
         if message.from_user.id not in settings.admin_telegram_ids_list:
@@ -1205,6 +1715,12 @@ async def create_admin_dispatcher() -> None:
     gain_alerts_handler = GainAlertsHandler(db)
     settings_handler = SettingsHandler(db, keyboards)
     userbots_handler = UserbotsHandler(db, keyboards)
+    analytics_handler = AnalyticsCommandsHandler(db)
+    info_handler = InfoHandler()
+    cmd_fwd_handler = CommandForwardingHandler(db, keyboards)
+    analytics_model = AnalyticsModel(db)
+    dexscreener_api = get_dexscreener_client()
+    invest_handler = InvestHandler(analytics_model, dexscreener_api, source_model)
 
     async def show_settings(query: types.CallbackQuery) -> None:
         await settings_handler.show_settings_menu(query)
@@ -1215,17 +1731,55 @@ async def create_admin_dispatcher() -> None:
         F.from_user.id.in_(settings.admin_telegram_ids_list),
     )
 
-    for register_factory in get_router_factories(gain_alerts_handler, userbots_handler, settings_handler):
+    for register_factory in get_router_factories(gain_alerts_handler, userbots_handler, settings_handler, cmd_fwd_handler):
         register_factory(dp)
+
+    invest_router = get_invest_router(invest_handler, settings)
+    dp.include_router(invest_router)
 
     dp.message.register(cmd_all_commands, Command(commands=["all", "commands", "help"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
     dp.message.register(cmd_inspect, Command(commands=["i"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
     dp.message.register(cmd_restart, Command(commands=["restart", "str"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
     dp.message.register(cmd_stop, Command(commands=["stop"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(cmd_stop_ca, Command(commands=["stop_ca"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(cmd_start_ca, Command(commands=["start_ca"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
     dp.message.register(cmd_clean_contracts, Command(commands=["clean_ca", "wipe_ca"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
     dp.message.register(cmd_trigger, Command(commands=["trigger", "tri"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
 
+    # Analytics commands
+    dp.message.register(analytics_handler.cmd_stats, Command(commands=["stats"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(analytics_handler.cmd_top, Command(commands=["top", "leaderboard"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(analytics_handler.cmd_patterns, Command(commands=["patterns"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(analytics_handler.cmd_besthold, Command(commands=["besthold"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(info_handler.cmd_info, Command(commands=["info", "whois", "chatinfo"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.callback_query.register(
+        analytics_handler.handle_timezone_selection,
+        F.data.startswith("patterns:tz:"),
+        F.from_user.id.in_(settings.admin_telegram_ids_list),
+    )
+    dp.message.register(settings_handler.cmd_timeframes, Command(commands=["timeframes"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(settings_handler.cmd_add_timeframe, Command(commands=["addtimeframe"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+    dp.message.register(settings_handler.cmd_del_timeframe, Command(commands=["deltimeframe"]), F.from_user.id.in_(settings.admin_telegram_ids_list))
+
     await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_my_commands([
+        BotCommand(command="i", description="Inspect token details"),
+        BotCommand(command="tri", description="Force gain alert"),
+        BotCommand(command="str", description="Restart stopped token"),
+        BotCommand(command="stop", description="Stop tracking token"),
+        BotCommand(command="stop_ca", description="Stop CA tracking"),
+        BotCommand(command="start_ca", description="Resume CA tracking"),
+        BotCommand(command="stats", description="Performance stats"),
+        BotCommand(command="top", description="Leaderboard"),
+        BotCommand(command="patterns", description="Time pattern analysis"),
+        BotCommand(command="besthold", description="Best hold duration"),
+        BotCommand(command="invest", description="Investment simulator"),
+        BotCommand(command="info", description="DB info"),
+        BotCommand(command="whois", description="DB info"),
+        BotCommand(command="timeframes", description="Hold durations"),
+        BotCommand(command="menu", description="Show main menu"),
+        BotCommand(command="all", description="Show all commands"),
+    ])
     logger.info("Admin bot polling started (integrated mode)")
     await dp.start_polling(bot, handle_signals=False)
 

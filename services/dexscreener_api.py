@@ -12,6 +12,11 @@ from typing import Dict, Any, Optional, Deque, List
 from decimal import Decimal
 from datetime import datetime, timedelta
 
+from db import db
+from models.api_metrics import ApiMetricsModel
+from models.token import TokenModel
+from models.api_call_log import ApiCallLogModel
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +36,24 @@ class DexScreenerAPIClient:
         self._cache_timestamps: Dict[str, datetime] = {}
         self._rate_limit_lock = asyncio.Lock()
         self._request_times: Deque[float] = deque()
+        self._metrics = ApiMetricsModel(db)
+        self._token_model = TokenModel(db)
+        self._api_call_log = ApiCallLogModel(db)
+        self._last_error: Dict[str, str] = {}
+
+    def _set_last_error(
+        self,
+        address: str,
+        status_code: Optional[int],
+        message: str,
+    ) -> None:
+        address = address.strip()
+        if not address:
+            return
+        self._last_error[address] = f"{status_code}:{message}" if status_code else message
+
+    def get_last_error(self, address: str) -> Optional[str]:
+        return self._last_error.get(address.strip())
 
     async def start(self) -> None:
         if not self.session:
@@ -85,6 +108,15 @@ class DexScreenerAPIClient:
         )
         return best_pair
 
+    def get_cached_pair(self, address: str, chain_id: str = "solana", freshness_secs: int = 15) -> Optional[Dict[str, Any]]:
+        cache_key = f"{(chain_id or 'solana').lower()}:{address.strip()}"
+        ts = self._cache_timestamps.get(cache_key)
+        if not ts:
+            return None
+        if (datetime.utcnow() - ts).total_seconds() > freshness_secs:
+            return None
+        return self._cache.get(cache_key)
+
     async def fetch_token_pairs(
         self,
         address: str,
@@ -109,6 +141,8 @@ class DexScreenerAPIClient:
         if not self.session:
             await self.start()
 
+        result: Optional[List[Dict[str, Any]]] = None
+
         endpoints = [
             ("tokens_v1", f"{self.TOKENS_URL}/{normalized_chain}/{address}"),
             ("token_pairs_v1", f"{self.TOKEN_PAIRS_URL}/{normalized_chain}/{address}"),
@@ -116,105 +150,147 @@ class DexScreenerAPIClient:
         ]
 
         combined_empty_payloads: Dict[str, Any] = {}
+        last_status: Optional[int] = None
+        last_message: Optional[str] = None
 
-        for attempt in range(self.MAX_RETRIES):
-            retry_due_to_backoff = False
-            empty_payloads = {}
+        try:
+            for attempt in range(self.MAX_RETRIES):
+                retry_due_to_backoff = False
+                empty_payloads = {}
 
-            try:
-                for endpoint_name, url in endpoints:
-                    await self._apply_rate_limit()
-                    logger.debug(
-                        "[DEXSCREENER] Fetching %s:%s via %s (attempt %s/%s)",
-                        chain_id,
-                        address[:8],
-                        endpoint_name,
-                        attempt + 1,
-                        self.MAX_RETRIES,
-                    )
-
-                    async with self.session.get(url) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            pairs = self._extract_pairs(data)
-
-                            if pairs:
-                                self._cache[cache_key] = pairs
-                                self._cache_timestamps[cache_key] = datetime.utcnow()
-                                return pairs
-
-                            empty_payloads[endpoint_name] = data
-                            combined_empty_payloads[endpoint_name] = data
-                            continue
-
-                        if response.status == 404:
-                            empty_payloads[endpoint_name] = {"status": 404}
-                            combined_empty_payloads[endpoint_name] = {"status": 404}
-                            continue
-
-                        if response.status == 429:
-                            backoff_time = self.BACKOFF_BASE ** (attempt + 1)
-                            logger.warning(
-                                "[DEXSCREENER] Rate limited for %s:%s via %s, backoff %ss",
-                                chain_id,
-                                address[:8],
-                                endpoint_name,
-                                backoff_time,
-                            )
-                            if attempt < self.MAX_RETRIES - 1:
-                                await asyncio.sleep(backoff_time)
-                                retry_due_to_backoff = True
-                                break
-                            logger.error("[DEXSCREENER] Max retries exceeded for %s:%s", chain_id, address[:8])
-                            return None
-
-                        text = await response.text()
-                        logger.error(
-                            "[DEXSCREENER] Unexpected status %s for %s:%s via %s: %s",
-                            response.status,
+                try:
+                    for endpoint_name, url in endpoints:
+                        await self._apply_rate_limit()
+                        logger.debug(
+                            "[DEXSCREENER] Fetching %s:%s via %s (attempt %s/%s)",
                             chain_id,
                             address[:8],
                             endpoint_name,
-                            text[:200],
+                            attempt + 1,
+                            self.MAX_RETRIES,
                         )
 
-                        if 500 <= response.status < 600 and attempt < self.MAX_RETRIES - 1:
-                            backoff_time = self.BACKOFF_BASE ** attempt
-                            await asyncio.sleep(backoff_time)
-                            retry_due_to_backoff = True
-                            break
+                        async with self.session.get(url) as response:
+                            start_ts = datetime.utcnow()
+                            if response.status == 200:
+                                data = await response.json()
+                                pairs = self._extract_pairs(data)
 
-                if retry_due_to_backoff:
-                    continue
+                                if pairs:
+                                    self._cache[cache_key] = pairs
+                                    self._cache_timestamps[cache_key] = datetime.utcnow()
+                                    result = pairs
+                                    latency = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+                                    await self._api_call_log.record("dexscreener", "poll", response.status, None, latency)
+                                    await self._token_model.update_last_api_error(address, None, None, None)
+                                    return result
 
-            except asyncio.TimeoutError:
-                logger.error("[DEXSCREENER] Timeout fetching %s:%s", chain_id, address[:8])
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.BACKOFF_BASE ** attempt)
-                    continue
-                return None
-            except aiohttp.ClientError as exc:
-                logger.error("[DEXSCREENER] Client error for %s:%s: %s", chain_id, address[:8], exc)
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.BACKOFF_BASE ** attempt)
-                    continue
-                return None
-            except Exception as exc:
-                logger.error(
-                    "[DEXSCREENER] Unexpected error for %s:%s: %s",
-                    chain_id,
-                    address[:8],
-                    exc,
-                    exc_info=True,
-                )
-                return None
+                                empty_payloads[endpoint_name] = data
+                                combined_empty_payloads[endpoint_name] = data
+                                latency = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+                                await self._api_call_log.record("dexscreener", "poll", response.status, "empty", latency)
+                                continue
 
-        if combined_empty_payloads:
-            self._cache[cache_key] = []
-            self._cache_timestamps[cache_key] = datetime.utcnow()
-            return []
+                            if response.status == 404:
+                                empty_payloads[endpoint_name] = {"status": 404}
+                                combined_empty_payloads[endpoint_name] = {"status": 404}
+                                last_status = 404
+                                last_message = "not_found"
+                                latency = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+                                await self._api_call_log.record("dexscreener", "poll", 404, "not_found", latency)
+                                continue
 
-        return None
+                            if response.status == 429:
+                                backoff_time = self.BACKOFF_BASE ** (attempt + 1)
+                                logger.warning(
+                                    "[DEXSCREENER] Rate limited for %s:%s via %s, backoff %ss",
+                                    chain_id,
+                                    address[:8],
+                                    endpoint_name,
+                                    backoff_time,
+                                )
+                                last_status = 429
+                                last_message = "rate_limited"
+                                latency = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+                                await self._api_call_log.record("dexscreener", "poll", 429, "rate_limited", latency)
+                                if attempt < self.MAX_RETRIES - 1:
+                                    await asyncio.sleep(backoff_time)
+                                    retry_due_to_backoff = True
+                                    break
+                                logger.error("[DEXSCREENER] Max retries exceeded for %s:%s", chain_id, address[:8])
+                                result = None
+                                return result
+
+                            text = await response.text()
+                            logger.error(
+                                "[DEXSCREENER] Unexpected status %s for %s:%s via %s: %s",
+                                response.status,
+                                chain_id,
+                                address[:8],
+                                endpoint_name,
+                                text[:200],
+                            )
+                            last_status = response.status
+                            last_message = "unexpected_status"
+                            latency = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+                            await self._api_call_log.record("dexscreener", "poll", response.status, "unexpected_status", latency)
+
+                            if 500 <= response.status < 600 and attempt < self.MAX_RETRIES - 1:
+                                backoff_time = self.BACKOFF_BASE ** attempt
+                                await asyncio.sleep(backoff_time)
+                                retry_due_to_backoff = True
+                                break
+
+                    if retry_due_to_backoff:
+                        continue
+
+                except asyncio.TimeoutError:
+                    logger.error("[DEXSCREENER] Timeout fetching %s:%s", chain_id, address[:8])
+                    last_status = None
+                    last_message = "timeout"
+                    await self._api_call_log.record("dexscreener", "poll", None, "timeout", None)
+                    if attempt < self.MAX_RETRIES - 1:
+                        await asyncio.sleep(self.BACKOFF_BASE ** attempt)
+                        continue
+                    result = None
+                    return result
+                except aiohttp.ClientError as exc:
+                    logger.error("[DEXSCREENER] Client error for %s:%s: %s", chain_id, address[:8], exc)
+                    last_status = None
+                    last_message = f"client_error:{exc.__class__.__name__}"
+                    await self._api_call_log.record("dexscreener", "poll", None, last_message, None)
+                    if attempt < self.MAX_RETRIES - 1:
+                        await asyncio.sleep(self.BACKOFF_BASE ** attempt)
+                        continue
+                    result = None
+                    return result
+                except Exception as exc:
+                    logger.error(
+                        "[DEXSCREENER] Unexpected error for %s:%s: %s",
+                        chain_id,
+                        address[:8],
+                        exc,
+                        exc_info=True,
+                    )
+                    last_status = None
+                    last_message = f"exception:{exc.__class__.__name__}"
+                    await self._api_call_log.record("dexscreener", "poll", None, last_message, None)
+                    result = None
+                    return result
+
+            if combined_empty_payloads:
+                self._cache[cache_key] = []
+                self._cache_timestamps[cache_key] = datetime.utcnow()
+                result = []
+                return result
+
+            result = None
+            return result
+        finally:
+            if result is None and last_message:
+                self._set_last_error(address, last_status, last_message)
+                await self._token_model.update_last_api_error(address, "dexscreener", last_status, last_message)
+            await self._metrics.record_check("dexscreener", result is not None)
 
     @staticmethod
     def _select_preferred_pair(pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -238,29 +314,32 @@ class DexScreenerAPIClient:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _to_decimal(value: Any) -> Optional[Decimal]:
+        try:
+            if value is None:
+                return None
+            return Decimal(str(value))
+        except Exception:
+            return None
+
     def get_market_cap(self, pair_data: Optional[Dict[str, Any]]) -> Optional[Decimal]:
         if not pair_data:
             return None
         fdv = pair_data.get("fdv") or pair_data.get("marketCap")
-        if fdv is None or fdv <= 0:
+        fdv_dec = self._to_decimal(fdv)
+        if fdv_dec is None or fdv_dec <= 0:
             return None
-        try:
-            return Decimal(str(fdv))
-        except Exception as exc:
-            logger.error("[DEXSCREENER] Error parsing market cap '%s': %s", fdv, exc)
-            return None
+        return fdv_dec
 
     def get_price(self, pair_data: Optional[Dict[str, Any]]) -> Optional[Decimal]:
         if not pair_data:
             return None
         price = pair_data.get("priceUsd")
-        if price is None or price <= 0:
+        price_dec = self._to_decimal(price)
+        if price_dec is None or price_dec <= 0:
             return None
-        try:
-            return Decimal(str(price))
-        except Exception as exc:
-            logger.error("[DEXSCREENER] Error parsing price '%s': %s", price, exc)
-            return None
+        return price_dec
 
     def get_liquidity(self, pair_data: Optional[Dict[str, Any]]) -> Optional[Decimal]:
         if not pair_data:
@@ -270,13 +349,10 @@ class DexScreenerAPIClient:
             liquidity = liquidity_data.get("usd")
         else:
             liquidity = liquidity_data
-        if liquidity is None or liquidity < 0:
+        liquidity_dec = self._to_decimal(liquidity)
+        if liquidity_dec is None or liquidity_dec < 0:
             return None
-        try:
-            return Decimal(str(liquidity))
-        except Exception as exc:
-            logger.error("[DEXSCREENER] Error parsing liquidity '%s': %s", liquidity, exc)
-            return None
+        return liquidity_dec
 
     def get_ticker(self, pair_data: Optional[Dict[str, Any]]) -> Optional[str]:
         if not pair_data:

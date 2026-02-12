@@ -82,6 +82,176 @@ ALTER TABLE tokens_tracked ADD COLUMN IF NOT EXISTS caller_user_id BIGINT;
 
 ---
 
+## Phase 1.5: MC History for Investment Simulator
+
+**Goal:** Store market cap history on every poll to enable time-based hold strategies. Allow custom timeframes via UI.
+
+### 1.5.1 New Tables
+
+```sql
+-- MC history snapshots
+CREATE TABLE token_mc_history (
+    id BIGSERIAL PRIMARY KEY,
+    token_id BIGINT REFERENCES tokens_tracked(id) ON DELETE CASCADE,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    market_cap NUMERIC(24, 6) NOT NULL
+);
+
+CREATE INDEX idx_mc_history_token_time
+ON token_mc_history(token_id, recorded_at DESC);
+
+CREATE INDEX idx_mc_history_lookup
+ON token_mc_history(token_id, recorded_at);
+
+-- Custom hold timeframes (user-configurable)
+CREATE TABLE hold_timeframes (
+    id BIGSERIAL PRIMARY KEY,
+    label TEXT NOT NULL UNIQUE,          -- "5m", "1h", "2d", etc.
+    seconds INT NOT NULL,                 -- duration in seconds
+    display_order INT DEFAULT 0,          -- for UI sorting
+    is_default BOOLEAN DEFAULT false,     -- show by default in /invest
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Seed default timeframes
+INSERT INTO hold_timeframes (label, seconds, display_order, is_default) VALUES
+('5m', 300, 1, true),
+('10m', 600, 2, false),
+('15m', 900, 3, true),
+('30m', 1800, 4, true),
+('45m', 2700, 5, false),
+('1h', 3600, 10, true),
+('2h', 7200, 11, false),
+('3h', 10800, 12, false),
+('6h', 21600, 13, true),
+('12h', 43200, 14, false),
+('24h', 86400, 20, true),
+('48h', 172800, 21, false),
+('72h', 259200, 22, false),
+('7d', 604800, 30, true),
+('14d', 1209600, 31, false),
+('30d', 2592000, 32, true);
+```
+
+### 1.5.2 Data Collection
+
+On every poll in `scheduler/dex_service.py`:
+
+```python
+await self._record_mc_history(token_id, market_cap)
+
+async def _record_mc_history(self, token_id: int, market_cap: Decimal) -> None:
+    await db.execute(
+        """
+        INSERT INTO token_mc_history (token_id, market_cap)
+        VALUES ($1, $2)
+        """,
+        token_id,
+        market_cap,
+    )
+```
+
+### 1.5.3 Query Helpers
+
+```python
+async def get_mc_at_time(self, token_id: int, target_time: datetime) -> Optional[Decimal]:
+    """Get MC closest to target time (within 5 min tolerance)."""
+    record = await db.fetchrow(
+        """
+        SELECT market_cap
+        FROM token_mc_history
+        WHERE token_id = $1
+          AND recorded_at BETWEEN $2 - INTERVAL '5 minutes'
+                              AND $2 + INTERVAL '5 minutes'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (recorded_at - $2))) ASC
+        LIMIT 1
+        """,
+        token_id,
+        target_time,
+    )
+    return Decimal(record["market_cap"]) if record else None
+
+async def get_mc_after_duration(
+    self, token_id: int, first_seen_at: datetime, duration_seconds: int
+) -> Optional[Decimal]:
+    """Get MC at specific duration after first_seen."""
+    target_time = first_seen_at + timedelta(seconds=duration_seconds)
+    return await self.get_mc_at_time(token_id, target_time)
+
+async def get_hold_timeframes(self, defaults_only: bool = False) -> List[Dict]:
+    """Get all configured hold timeframes."""
+    if defaults_only:
+        return await db.fetch(
+            "SELECT * FROM hold_timeframes WHERE is_default = true ORDER BY display_order"
+        )
+    return await db.fetch(
+        "SELECT * FROM hold_timeframes ORDER BY display_order"
+    )
+```
+
+### 1.5.4 UI for Custom Timeframes
+
+**Access:** Settings → Hold Timeframes
+
+**Features:**
+- View all timeframes (default + custom)
+- Add new: `/addtimeframe 4h` or button → prompts for duration
+- Toggle default on/off (which show in /invest by default)
+- Delete custom timeframes
+- Reorder display
+
+**Commands:**
+```
+/timeframes              - List all
+/addtimeframe 4h         - Add "4h" (14400 seconds)
+/deltimeframe 4h         - Remove
+```
+
+**UI Flow:**
+```
+⏱ Hold Timeframes
+
+Defaults (shown in /invest):
+✅ 5m | ✅ 15m | ✅ 30m | ✅ 1h | ✅ 6h | ✅ 24h | ✅ 7d | ✅ 30d
+
+All available:
+5m, 10m, 15m, 30m, 45m, 1h, 2h, 3h, 6h, 12h, 24h, 48h, 72h, 7d, 14d, 30d
+
+[+ Add Timeframe]  [Edit Defaults]
+```
+
+### 1.5.5 Dynamic /invest Hold Options
+
+When showing hold strategy buttons in `/invest`, pull from DB:
+
+```python
+timeframes = await analytics_model.get_hold_timeframes(defaults_only=True)
+buttons = [
+    InlineKeyboardButton(text=tf["label"], callback_data=f"invest:hold:{tf['seconds']}")
+    for tf in timeframes
+]
+buttons.append(InlineKeyboardButton(text="To Peak", callback_data="invest:hold:peak"))
+buttons.append(InlineKeyboardButton(text="Current", callback_data="invest:hold:current"))
+buttons.append(InlineKeyboardButton(text="More...", callback_data="invest:hold:more"))
+```
+
+### 1.5.6 Data Retention
+
+```sql
+-- Cleanup old data (run daily via scheduler)
+DELETE FROM token_mc_history
+WHERE recorded_at < NOW() - INTERVAL '30 days';
+```
+
+**Files to create/modify:**
+- `migrations/009_mc_history.sql` - New tables + seed data
+- `scheduler/dex_service.py` - Record MC on each poll
+- `models/analytics.py` - Query helpers
+- `ui/handlers/settings.py` - Timeframe management UI
+- `admin_bot.py` - /timeframes, /addtimeframe, /deltimeframe commands
+
+---
+
 ## Phase 2: Stats Calculation Engine
 
 **Goal:** Build the calculation logic for all stats.

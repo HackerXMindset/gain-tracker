@@ -7,7 +7,7 @@ from aiogram.filters import StateFilter
 
 from config import settings
 from ui.handlers.settings import SettingsHandler
-from ui.states import AdminStates
+from ui.states import AdminStates, AutoTraderStates
 
 
 def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
@@ -114,6 +114,140 @@ def register(dispatcher: Dispatcher, handler: SettingsHandler) -> None:
     dispatcher.callback_query.register(
         handler.show_scheduler_overview,
         F.data.startswith("settings:scheduler_overview"),
+        admin_filter,
+    )
+
+    dispatcher.callback_query.register(
+        handler.show_autotrader_entry,
+        F.data.startswith("settings:autotrader"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_dest_here,
+        F.data == "autotrader:dest:here",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_dest_dm,
+        F.data == "autotrader:dest:dm",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_dest_custom,
+        F.data == "autotrader:dest:custom",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        lambda q: handler.show_autotrader_errors(q, page=1),
+        F.data == "settings:autotrader_errors",
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        lambda q: handler.show_autotrader_errors(q, page=int(q.data.split(":")[-1])),
+        F.data.startswith("settings:autotrader_errors:page:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.show_autotrader_errors,
+        F.data.startswith("settings:autotrader_errors"),
+        admin_filter,
+    )
+
+    # AutoTrader FSM (simple linear wizard)
+    dispatcher.message.register(
+        handler.autotrader_get_destination,
+        StateFilter(AutoTraderStates.awaiting_destination),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_budget_button,
+        F.data.startswith("autotrader:budget:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_per_coin_button,
+        F.data.startswith("autotrader:per:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_per_coin_button,
+        StateFilter(AutoTraderStates.awaiting_per_coin),
+        F.data.startswith("autotrader:per:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_coin_cap_button,
+        F.data.startswith("autotrader:cap:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_stop_choice,
+        F.data.startswith("autotrader:stop:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_channels_button,
+        F.data.startswith("autotrader:channels:"),
+        admin_filter,
+    )
+    dispatcher.callback_query.register(
+        handler.autotrader_interval_button,
+        F.data.startswith("autotrader:interval:"),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_custom_coin_cap,
+        StateFilter(AutoTraderStates.awaiting_custom_coin_cap),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_custom_budget,
+        StateFilter(AutoTraderStates.awaiting_custom_budget),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_custom_per_coin,
+        StateFilter(AutoTraderStates.awaiting_custom_per_coin),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_custom_interval,
+        StateFilter(AutoTraderStates.awaiting_custom_interval),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_budget,
+        StateFilter(AutoTraderStates.awaiting_budget),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_per_coin,
+        StateFilter(AutoTraderStates.awaiting_per_coin),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_hold,
+        StateFilter(AutoTraderStates.awaiting_hold),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_coin_cap,
+        StateFilter(AutoTraderStates.awaiting_coin_cap),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_channel_mode,
+        StateFilter(AutoTraderStates.awaiting_channel_mode),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_channels,
+        StateFilter(AutoTraderStates.awaiting_channels),
+        admin_filter,
+    )
+    dispatcher.message.register(
+        handler.autotrader_get_report_interval,
+        StateFilter(AutoTraderStates.awaiting_report_interval),
         admin_filter,
     )
 

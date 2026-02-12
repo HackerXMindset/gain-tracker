@@ -901,14 +901,17 @@ class ChartAndSettingsMixin:
             f"Last guardrail: {guardrail_text}",
         ]
         if entry["chat_type"] == "group":
-            text_lines.append(f"Tracked users: {entry['tracked_user_count']}")
+            if entry.get("track_all_users"):
+                text_lines.append("Tracked users: all members")
+            else:
+                text_lines.append(f"Tracked users: {entry['tracked_user_count']}")
 
         markup = self.keyboards.gain_alerts_detail(
             chat_id,
             has_template=entry["has_template"],
             has_sensitivity=entry["has_sensitivity"],
             sender_label=entry["sender_label"],
-            has_tracked_users=(entry["tracked_user_count"] > 0),
+            has_tracked_users=(entry["tracked_user_count"] > 0 or entry.get("track_all_users")),
             has_chart=entry["has_chart"],
             tracker_label=entry["tracker_label"],
         )

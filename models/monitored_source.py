@@ -9,6 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 class MonitoredSourceModel(BaseModel):
+    async def get_all(self) -> List[Dict[str, Any]]:
+        return await self.db.fetch("SELECT * FROM monitored_sources ORDER BY created_at DESC")
+
     async def get_all_with_stats(self) -> List[Dict[str, Any]]:
         return await self.db.fetch(
             """
@@ -79,9 +82,6 @@ class MonitoredSourceModel(BaseModel):
         if chat_type not in {"group", "channel", "dm"}:
             raise ValueError(f"Unsupported chat_type '{chat_type}' for monitored source")
 
-        if chat_type == "group" and user_id is None:
-            raise ValueError("Groups require a specific user_id to monitor")
-
         if chat_type in {"channel", "dm"} and user_id is not None:
             raise ValueError(f"{chat_type} sources must not specify user_id")
 
@@ -95,6 +95,29 @@ class MonitoredSourceModel(BaseModel):
             chat_type,
             user_id,
             admin_id,
+        )
+
+    async def get_matching_source(self, chat_id: int, sender_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        return await self.db.fetchrow(
+            """
+            SELECT *
+            FROM monitored_sources
+            WHERE chat_id = $1
+              AND (
+                    user_id = $2
+                    OR (chat_type = 'group' AND user_id IS NULL)
+                    OR (chat_type IN ('channel', 'dm') AND user_id IS NULL)
+              )
+            ORDER BY
+                CASE
+                    WHEN user_id = $2 THEN 1
+                    WHEN chat_type = 'group' AND user_id IS NULL THEN 2
+                    ELSE 3
+                END
+            LIMIT 1
+            """,
+            chat_id,
+            sender_id,
         )
 
     async def remove_source(self, source_id: int) -> bool:
@@ -115,6 +138,13 @@ class MonitoredSourceModel(BaseModel):
             source["user_id"],
         )
 
+        result = await self.db.execute(
+            "DELETE FROM monitored_sources WHERE id = $1",
+            source_id,
+        )
+        return result == "DELETE 1"
+
+    async def delete_source_row(self, source_id: int) -> bool:
         result = await self.db.execute(
             "DELETE FROM monitored_sources WHERE id = $1",
             source_id,
@@ -253,6 +283,42 @@ class MonitoredSourceModel(BaseModel):
             """,
             source_id,
             target_chat_id,
+        )
+        return result == "DELETE 1"
+
+    async def is_user_excluded(self, chat_id: int, user_id: int) -> bool:
+        result = await self.db.fetchrow(
+            """
+            SELECT 1
+            FROM monitored_source_exclusions
+            WHERE chat_id = $1 AND user_id = $2
+            """,
+            chat_id,
+            user_id,
+        )
+        return result is not None
+
+    async def add_exclusion(self, chat_id: int, user_id: int) -> bool:
+        result = await self.db.fetchrow(
+            """
+            INSERT INTO monitored_source_exclusions (chat_id, user_id)
+            VALUES ($1, $2)
+            ON CONFLICT (chat_id, user_id) DO NOTHING
+            RETURNING id
+            """,
+            chat_id,
+            user_id,
+        )
+        return result is not None
+
+    async def remove_exclusion(self, chat_id: int, user_id: int) -> bool:
+        result = await self.db.execute(
+            """
+            DELETE FROM monitored_source_exclusions
+            WHERE chat_id = $1 AND user_id = $2
+            """,
+            chat_id,
+            user_id,
         )
         return result == "DELETE 1"
 

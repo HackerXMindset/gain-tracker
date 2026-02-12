@@ -12,10 +12,17 @@ from typing import Dict, Optional, Tuple
 from aiogram import types
 from aiogram.fsm.context import FSMContext
 
-from models import ChartRequestGroupModel, SettingsModel
+from models import (
+    ChartRequestGroupModel,
+    SettingsModel,
+    AnalyticsModel,
+    ApiMetricsModel,
+    AutoTraderRunModel,
+)
+from config import settings
 from scheduler import get_dex_service
 from ui.keyboards import Keyboards
-from ui.states import AdminStates
+from ui.states import AdminStates, AutoTraderStates
 from alerts.templates import (
     DEFAULT_GAIN_ALERT_TEMPLATE,
     normalise_template,
@@ -41,6 +48,8 @@ class SettingsHandler:
         self.keyboards = keyboards
         self.settings_model = SettingsModel(db_pool)
         self.chart_group_model = ChartRequestGroupModel(db_pool)
+        self.analytics_model = AnalyticsModel(db_pool)
+        self.autotrader_runs = AutoTraderRunModel(db_pool)
 
     def _compose_gain_alert_settings_text(
         self,
@@ -193,6 +202,479 @@ class SettingsHandler:
             logger.error("Error showing settings menu: %s", exc)
             await query.answer("❌ Error loading settings", show_alert=True)
 
+    async def show_autotrader_entry(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        if not settings.enable_autotrader:
+            await query.answer("AutoTrader is disabled. Set ENABLE_AUTOTRADER=true to enable.", show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(AutoTraderStates.awaiting_destination)
+
+        # Stats summary
+        runs = await self.autotrader_runs.db.fetch(
+            "SELECT status, COUNT(*) AS c FROM autotrader_runs GROUP BY status"
+        )
+        status_counts = {r["status"]: r["c"] for r in runs}
+        skips_24h = await self.autotrader_runs.db.fetchval(
+            """
+            SELECT COUNT(*) FROM autotrader_events
+            WHERE event_type='skip' AND created_at >= NOW() - interval '24 hours'
+            """
+        )
+        text = (
+            "<b>🤖 AutoTrader</b>\n"
+            "Live invest with fresh data (≤15s) using your budget, per-coin spend, channels, and hold.\n\n"
+            f"Runs — pending:{status_counts.get('pending',0)} running:{status_counts.get('running',0)} completed:{status_counts.get('completed',0)}\n"
+            f"Skips (last 24h): {skips_24h or 0}\n\n"
+            "Where should alerts/reports go?\n"
+            "- Send 'here' to use this chat\n"
+            "- Send 'dm' to use your DM\n"
+            "- Or send a chat ID\n"
+        )
+        await query.message.edit_text(text, reply_markup=self.keyboards.autotrader_destinations())
+        await query.answer()
+
+    async def autotrader_get_destination(self, message: types.Message, state: FSMContext) -> None:
+        txt = message.text.strip().lower()
+        dest_chat_id = None
+        dest_type = "chat"
+        if txt == "here":
+            dest_chat_id = message.chat.id
+            dest_type = "chat"
+        elif txt == "dm":
+            dest_chat_id = message.from_user.id
+            dest_type = "dm"
+        else:
+            try:
+                dest_chat_id = int(txt)
+                dest_type = "chat"
+            except Exception:
+                await message.answer("Send 'here', 'dm', or a numeric chat ID.")
+                return
+        await state.update_data(destination_chat_id=dest_chat_id, destination_type=dest_type)
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await message.answer("Enter total budget (USD):", reply_markup=self.keyboards.autotrader_budget())
+
+    async def autotrader_dest_here(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(destination_chat_id=query.message.chat.id, destination_type="chat")
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await query.message.edit_text("Enter total budget (USD):", reply_markup=self.keyboards.autotrader_budget())
+        await query.answer()
+
+    async def autotrader_dest_dm(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(destination_chat_id=query.from_user.id, destination_type="dm")
+        await state.set_state(AutoTraderStates.awaiting_budget)
+        await query.message.edit_text("Enter total budget (USD):", reply_markup=self.keyboards.autotrader_budget())
+        await query.answer()
+
+    async def autotrader_dest_custom(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(AutoTraderStates.awaiting_destination)
+        await query.message.edit_text("Send the chat ID to receive alerts/reports:")
+        await query.answer()
+
+    async def autotrader_get_budget(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            budget = float(message.text.replace(",", ""))
+            if budget <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for budget (e.g., 10000).")
+            return
+        await state.update_data(budget_total=budget, remaining_cash=budget)
+        await state.set_state(AutoTraderStates.awaiting_per_coin)
+        await message.answer("Per-coin spend (USD):", reply_markup=self.keyboards.autotrader_per_coin())
+
+    async def autotrader_budget_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_budget)
+            await query.message.edit_text("Enter total budget (USD):")
+        else:
+            await state.update_data(budget_total=float(val), remaining_cash=float(val))
+            await state.set_state(AutoTraderStates.awaiting_per_coin)
+            await query.message.edit_text("Per-coin spend (USD):", reply_markup=self.keyboards.autotrader_per_coin())
+        await query.answer()
+
+    async def autotrader_per_coin_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_per_coin)
+            await query.message.edit_text("Enter per-coin spend (USD):")
+        else:
+            spend = float(val)
+            await state.update_data(per_coin_spend=spend)
+            await state.set_state(AutoTraderStates.awaiting_hold)
+            await query.message.edit_text("Hold time in minutes (e.g., 60):")
+        await query.answer()
+
+    async def autotrader_custom_budget(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            budget = float(message.text.replace(",", ""))
+            if budget <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for budget (e.g., 10000).")
+            return
+        await state.update_data(budget_total=budget, remaining_cash=budget)
+        await state.set_state(AutoTraderStates.awaiting_per_coin)
+        await message.answer("Per-coin spend (USD):", reply_markup=self.keyboards.autotrader_per_coin())
+
+    async def autotrader_custom_per_coin(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            per_coin = float(message.text.replace(",", ""))
+            if per_coin <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for per-coin spend.")
+            return
+        await state.update_data(per_coin_spend=per_coin)
+        await state.set_state(AutoTraderStates.awaiting_hold)
+        await message.answer("Hold time in minutes (e.g., 60):")
+
+    async def autotrader_get_per_coin(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            per_coin = float(message.text.replace(",", ""))
+            if per_coin <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for per-coin spend.")
+            return
+        await state.update_data(per_coin_spend=per_coin)
+        await state.set_state(AutoTraderStates.awaiting_hold)
+        await message.answer("Hold time in minutes (e.g., 60):")
+
+    async def autotrader_get_hold(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            hold_min = int(message.text.strip())
+            if hold_min <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter hold time in minutes (positive integer).")
+            return
+        await state.update_data(hold_seconds=hold_min * 60)
+        await state.set_state(AutoTraderStates.awaiting_coin_cap)
+        await message.answer("Coin cap (how many coins to trade this run):", reply_markup=self.keyboards.autotrader_coin_cap())
+
+    async def autotrader_get_coin_cap(self, message: types.Message, state: FSMContext) -> None:
+        text = message.text.strip().lower()
+        if text == "skip":
+            cap = settings.autotrader_default_coin_cap
+        else:
+            try:
+                cap = int(text)
+                if cap <= 0:
+                    raise ValueError
+            except Exception:
+                await message.answer("Enter a positive integer or 'skip'.")
+                return
+        await state.update_data(coin_cap=cap)
+        await state.set_state(AutoTraderStates.awaiting_stop_choice)
+        await message.answer("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+
+    async def autotrader_coin_cap_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_coin_cap)
+            await query.message.edit_text("Enter coin cap (positive integer):")
+        elif val == "skip":
+            cap = settings.autotrader_default_coin_cap
+            await state.update_data(coin_cap=cap)
+            await state.set_state(AutoTraderStates.awaiting_stop_choice)
+            await query.message.edit_text("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+        else:
+            cap = int(val)
+            await state.update_data(coin_cap=cap)
+            await state.set_state(AutoTraderStates.awaiting_stop_choice)
+            await query.message.edit_text("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+        await query.answer()
+
+    async def autotrader_custom_coin_cap(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            cap = int(message.text.strip())
+            if cap <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive integer for coin cap.")
+            return
+        await state.update_data(coin_cap=cap)
+        await state.set_state(AutoTraderStates.awaiting_stop_choice)
+        await message.answer("Stop rules (optional):", reply_markup=self.keyboards.autotrader_stop_rules())
+
+    async def autotrader_stop_choice(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        choice = query.data.split(":")[-1]
+        if choice == "target":
+            await state.set_state(AutoTraderStates.awaiting_target_value)
+            await query.message.edit_text("Enter target portfolio value in USD (e.g., 20000):")
+        elif choice == "bankrupt":
+            await state.set_state(AutoTraderStates.awaiting_bankrupt_floor)
+            await query.message.edit_text("Enter bankrupt floor in USD (e.g., 500):")
+        elif choice == "endtime":
+            await state.set_state(AutoTraderStates.awaiting_channel_mode)
+            await query.message.edit_text("End time stop rule not yet implemented; continuing. Choose channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+        else:
+            await state.set_state(AutoTraderStates.awaiting_channel_mode)
+            await query.message.edit_text("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+        await query.answer()
+
+    async def autotrader_target_value(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            val = float(message.text.replace(",", ""))
+            if val <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for target value.")
+            return
+        await state.update_data(target_value=val)
+        await state.set_state(AutoTraderStates.awaiting_channel_mode)
+        await message.answer("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+
+    async def autotrader_bankrupt_floor(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            val = float(message.text.replace(",", ""))
+            if val <= 0:
+                raise ValueError
+        except Exception:
+            await message.answer("Enter a positive number for bankrupt floor.")
+            return
+        await state.update_data(bankrupt_floor=val)
+        await state.set_state(AutoTraderStates.awaiting_channel_mode)
+        await message.answer("Channel mode:", reply_markup=self.keyboards.autotrader_channel_mode())
+
+    async def autotrader_get_channel_mode(self, message: types.Message, state: FSMContext) -> None:
+        mode = message.text.strip().lower()
+        if mode not in {"single", "multi", "all"}:
+            await message.answer("Choose: single | multi | all")
+            return
+        await state.update_data(channel_mode=mode)
+        await state.set_state(AutoTraderStates.awaiting_channels)
+        await self._prompt_channels(message, mode)
+
+    async def autotrader_get_channels(self, message: types.Message, state: FSMContext) -> None:
+        txt = message.text.strip()
+        channels = []
+        if txt.lower() != "all":
+            channels = [p.strip() for p in txt.split(",") if p.strip()]
+            if not channels:
+                await message.answer("Provide at least one channel or type 'all'.")
+                return
+        await state.update_data(channels=channels)
+        await state.set_state(AutoTraderStates.awaiting_report_interval)
+        await message.answer("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:", reply_markup=self.keyboards.autotrader_interval())
+
+    async def autotrader_channels_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "all":
+            channels = []
+        elif val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_channels)
+            await query.message.edit_text("Provide channel IDs/usernames (comma separated) or 'all':")
+            await query.answer()
+            return
+        else:
+            channels = [val]
+        await state.update_data(channels=channels)
+        await state.set_state(AutoTraderStates.awaiting_report_interval)
+        await query.message.edit_text("Report interval in minutes (e.g., 240) or 'skip' to disable periodic reports:", reply_markup=self.keyboards.autotrader_interval())
+        await query.answer()
+
+    async def autotrader_get_report_interval(self, message: types.Message, state: FSMContext) -> None:
+        txt = message.text.strip().lower()
+        interval = None
+        if txt != "skip":
+            try:
+                minutes = int(txt)
+                if minutes <= 0:
+                    raise ValueError
+                interval = minutes * 60
+            except Exception:
+                await message.answer("Enter minutes as a positive integer or 'skip'.")
+                return
+
+        data = await state.get_data()
+        budget_total = data["budget_total"]
+        per_coin = data["per_coin_spend"]
+        hold_seconds = data["hold_seconds"]
+        coin_cap = data["coin_cap"]
+        channel_mode = data["channel_mode"]
+        channels = data.get("channels", [])
+        destination_chat_id = data.get("destination_chat_id") or message.chat.id
+        destination_type = data.get("destination_type") or "chat"
+
+        # Create run
+        run_id = await self.autotrader_runs.create_run(
+            {
+                "name": f"AutoTrader {channel_mode}",
+                "created_by_user_id": message.from_user.id,
+                "destination_chat_id": destination_chat_id,
+                "destination_type": destination_type,
+                "status": "pending",
+                "start_at": None,
+                "stop_at": None,
+                "budget_total": budget_total,
+                "per_coin_spend": per_coin,
+                "remaining_cash": budget_total,
+                "coin_cap": coin_cap,
+                "hold_seconds": hold_seconds,
+                "report_interval_seconds": interval,
+                "breakout_multiple": None,
+                "bankrupt_floor": data.get("bankrupt_floor"),
+                "target_value": data.get("target_value"),
+                "channel_mode": channel_mode,
+                "channels": channels if channels else None,
+                "freshness_secs": settings.autotrader_freshness_secs,
+                "max_retries": settings.autotrader_max_retries,
+            }
+        )
+
+        await state.clear()
+        summary = (
+            f"✅ AutoTrader run created (ID {run_id})\n"
+            f"Budget: ${budget_total:,.2f} | Per-coin: ${per_coin:,.2f}\n"
+            f"Hold: {hold_seconds//60} min | Coin cap: {coin_cap}\n"
+            f"Channels: {'all' if not channels else ', '.join(channels)} (mode: {channel_mode})\n"
+            f"Destination: {destination_type} ({destination_chat_id})\n"
+            f"Report interval: {'off' if interval is None else str(interval//60)+' min'}\n"
+            f"Stop rules: target={data.get('target_value')}, bankrupt_floor={data.get('bankrupt_floor')}\n"
+            "Status: pending (engine wiring next)."
+        )
+        await message.answer(summary, reply_markup=self.keyboards.settings_menu())
+
+    async def autotrader_interval_button(self, query: types.CallbackQuery, state: FSMContext) -> None:
+        val = query.data.split(":")[-1]
+        if val == "custom":
+            await state.set_state(AutoTraderStates.awaiting_custom_interval)
+            await query.message.edit_text("Enter report interval in minutes (e.g., 240):")
+            await query.answer()
+            return
+        if val == "skip":
+            interval = None
+        else:
+            interval = int(val) * 1
+        data = await state.get_data()
+        await self._finalize_autotrader_run(query.message, state, interval_seconds=interval)
+        await query.answer()
+
+    async def autotrader_custom_interval(self, message: types.Message, state: FSMContext) -> None:
+        try:
+            minutes = int(message.text.strip())
+            if minutes <= 0:
+                raise ValueError
+            interval = minutes * 60
+        except Exception:
+            await message.answer("Enter minutes as a positive integer.")
+            return
+        await self._finalize_autotrader_run(message, state, interval_seconds=interval)
+
+    async def _finalize_autotrader_run(self, message: types.Message, state: FSMContext, interval_seconds: Optional[int]) -> None:
+        data = await state.get_data()
+        budget_total = data["budget_total"]
+        per_coin = data["per_coin_spend"]
+        hold_seconds = data["hold_seconds"]
+        coin_cap = data["coin_cap"]
+        channel_mode = data["channel_mode"]
+        channels = data.get("channels", [])
+        destination_chat_id = data.get("destination_chat_id") or message.chat.id
+        destination_type = data.get("destination_type") or "chat"
+        run_id = await self.autotrader_runs.create_run(
+            {
+                "name": f"AutoTrader {channel_mode}",
+                "created_by_user_id": message.from_user.id,
+                "destination_chat_id": destination_chat_id,
+                "destination_type": destination_type,
+                "status": "pending",
+                "start_at": None,
+                "stop_at": None,
+                "budget_total": budget_total,
+                "per_coin_spend": per_coin,
+                "remaining_cash": budget_total,
+                "coin_cap": coin_cap,
+                "hold_seconds": hold_seconds,
+                "report_interval_seconds": interval_seconds,
+                "breakout_multiple": None,
+                "bankrupt_floor": data.get("bankrupt_floor"),
+                "target_value": data.get("target_value"),
+                "channel_mode": channel_mode,
+                "channels": channels if channels else None,
+                "freshness_secs": settings.autotrader_freshness_secs,
+                "max_retries": settings.autotrader_max_retries,
+            }
+        )
+        await state.clear()
+        summary = (
+            f"✅ AutoTrader run created (ID {run_id})\n"
+            f"Budget: ${budget_total:,.2f} | Per-coin: ${per_coin:,.2f}\n"
+            f"Hold: {hold_seconds//60} min | Coin cap: {coin_cap}\n"
+            f"Channels: {'all' if not channels else ', '.join(channels)} (mode: {channel_mode})\n"
+            f"Destination: {destination_type} ({destination_chat_id})\n"
+            f"Report interval: {'off' if interval_seconds is None else str(interval_seconds//60)+' min'}\n"
+            f"Stop rules: target={data.get('target_value')} bankrupt_floor={data.get('bankrupt_floor')}\n"
+            "Status: pending."
+        )
+        await message.answer(summary, reply_markup=self.keyboards.settings_menu())
+
+    async def _prompt_channels(self, message: types.Message, mode: str) -> None:
+        try:
+            sources = await self.source_model.get_all()
+            options = []
+            for src in sources[:10]:
+                label = f"{src.get('chat_id')} ({src.get('chat_type')})"
+                cb = f"autotrader:channels:{src.get('chat_id')}"
+                options.append((label, cb))
+            await message.answer(
+                "Select channel(s) or choose All/Custom:",
+                reply_markup=self.keyboards.autotrader_channels_list(options),
+            )
+        except Exception:
+            await message.answer("Provide channel IDs/usernames (comma separated) or 'all':")
+
+    async def show_autotrader_errors(self, query: types.CallbackQuery, page: int = 1) -> None:
+        if not settings.enable_autotrader:
+            await query.answer("AutoTrader is disabled.", show_alert=True)
+            return
+        try:
+            items_per_page = 15
+            offset = (page - 1) * items_per_page
+            summary = await self.autotrader_runs.db.fetch(
+                """
+                SELECT COALESCE(event_type,'skip') AS reason, COUNT(*) AS c
+                FROM autotrader_events
+                WHERE event_type='skip'
+                GROUP BY COALESCE(event_type,'skip')
+                ORDER BY c DESC
+                """
+            )
+            total = await self.autotrader_runs.db.fetchval(
+                "SELECT COUNT(*) FROM autotrader_events WHERE event_type='skip'"
+            )
+            total_pages = max(1, (int(total or 0) + items_per_page - 1) // items_per_page)
+            details = await self.autotrader_runs.db.fetch(
+                """
+                SELECT event_type, message, created_at
+                FROM autotrader_events
+                WHERE event_type='skip'
+                ORDER BY created_at DESC
+                LIMIT $1 OFFSET $2
+                """,
+                items_per_page,
+                offset,
+            )
+            text = "<b>⚠️ AutoTrader Skips / Errors</b>\n\n"
+            if summary:
+                for row in summary:
+                    text += f"{row['reason']}: {row['c']}\n"
+            else:
+                text += "No skips recorded.\n"
+            text += "\n<b>Recent Skips</b>\n"
+            if details:
+                for row in details:
+                    text += f"{row['created_at']}: {row['message']}\n"
+            else:
+                text += "None\n"
+            text += f"\nPage {page}/{total_pages}"
+            await query.message.edit_text(text, reply_markup=self.keyboards.autotrader_errors_nav(page, total_pages))
+            await query.answer()
+        except Exception as exc:
+            logger.error("Error showing autotrader errors: %s", exc, exc_info=True)
+            await query.answer("❌ Error loading autotrader errors", show_alert=True)
     async def show_gain_alert_settings(self, query: types.CallbackQuery) -> None:
         try:
             text, keyboard = await self._build_gain_alert_settings_view()
@@ -585,8 +1067,21 @@ class SettingsHandler:
 
     async def show_scheduler_overview(self, query: types.CallbackQuery) -> None:
         try:
+            page = 1
+            parts = (query.data or "").split(":")
+            if len(parts) >= 4 and parts[2] == "page":
+                try:
+                    page = max(1, int(parts[3]))
+                except ValueError:
+                    page = 1
+
             dex_service = get_dex_service()
             stats = await dex_service.get_service_stats()
+            api_metrics_model = ApiMetricsModel(self.db)
+            api_metrics = await api_metrics_model.get_all()
+            api_24h = await api_metrics_model.get_last_24h()
+            api_map = {row["api_name"]: row for row in api_metrics}
+            api_24h_map = {row["api_name"]: row for row in api_24h}
 
             tier_counts = await self.db.fetch(
                 """
@@ -601,6 +1096,81 @@ class SettingsHandler:
             stopped_count = await self.db.fetchval(
                 "SELECT COUNT(*) FROM tokens_tracked WHERE status = 'stopped'"
             )
+
+            active_tracking_count = await self.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM tokens_tracked
+                WHERE status = 'active'
+                   OR (status = 'stopped' AND tracking_until IS NOT NULL AND tracking_until > NOW())
+                """
+            )
+
+            # New source of truth: snapshot_tasks
+            missing_timeframes_count = await self.db.fetchval(
+                """
+                SELECT COUNT(DISTINCT token_id)
+                FROM snapshot_tasks
+                WHERE status IN ('pending','failed','due','late')
+                  AND target_time < NOW() - interval '1 minute'
+                """
+            )
+
+            autotrader_skips_24h = await self.db.fetchval(
+                "SELECT COUNT(*) FROM autotrader_events WHERE event_type='skip' AND created_at >= NOW() - interval '24 hours'"
+            )
+
+            missing_reason_rows = await self.db.fetch(
+                """
+                SELECT COALESCE(last_error_message, status) AS reason, COUNT(*) AS count
+                FROM snapshot_tasks
+                WHERE status IN ('pending','failed','late','due')
+                  AND target_time < NOW() - interval '1 minute'
+                GROUP BY COALESCE(last_error_message, status)
+                ORDER BY count DESC, reason
+                """
+            )
+
+            items_per_page = 6
+            offset = (page - 1) * items_per_page
+
+            missing_details = await self.db.fetch(
+                """
+                SELECT
+                    tt.address,
+                    COALESCE(ht.label, CONCAT(st.timeframe_seconds, 's')) AS label,
+                    st.target_time,
+                    COALESCE(st.last_error_message, st.status) AS reason,
+                    COALESCE(st.recorded_source, '-') AS source,
+                    st.last_error_message AS detail,
+                    st.last_error_api AS last_api_error_api,
+                    st.last_error_code AS last_api_error_code,
+                    st.last_error_message AS last_api_error_message,
+                    to_char(st.last_error_at AT TIME ZONE $3, 'YYYY-MM-DD HH24:MI:SS') AS last_api_error_at_local,
+                    st.target_time AT TIME ZONE $3 AS target_time_local
+                FROM snapshot_tasks st
+                JOIN tokens_tracked tt ON tt.id = st.token_id
+                LEFT JOIN hold_timeframes ht ON ht.seconds = st.timeframe_seconds
+                WHERE st.status IN ('pending','failed','late','due')
+                  AND st.target_time < NOW() - interval '1 minute'
+                ORDER BY st.target_time DESC
+                LIMIT $1 OFFSET $2
+                """,
+                items_per_page,
+                offset,
+                settings.timezone or "UTC",
+            )
+
+            missing_total = await self.db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM snapshot_tasks
+                WHERE status IN ('pending','failed','late','due')
+                  AND target_time < NOW() - interval '1 minute'
+                """
+            )
+
+            total_pages = max(1, (int(missing_total or 0) + items_per_page - 1) // items_per_page)
 
             tier_map = {
                 "tier_a": ("Tier A (10s)", 0),
@@ -621,17 +1191,87 @@ class SettingsHandler:
                 f"🔄 <b>Scheduler Active:</b> {'✅ Yes' if stats['scheduler_active'] else '❌ No'}\n"
                 f"📦 <b>Tokens in Queue:</b> {stats['tokens_in_queue']}\n"
                 f"⚙️ <b>Service Running:</b> {'✅ Yes' if stats['running'] else '❌ No'}\n\n"
+                f"🧾 <b>Active Timeframe Recording:</b> {active_tracking_count or 0} tokens\n"
+                f"⚠️ <b>Missing Timeframes:</b> {missing_timeframes_count or 0} tokens\n\n"
                 "<b>📈 By Tier:</b>\n"
             )
 
             for tier_name, count in tier_map.values():
                 text += f"  ├ {tier_name}: {count} tokens\n"
 
-            text += f"\n⛔ <b>Stopped:</b> {stopped_count or 0} tokens"
+            text += f"\n⛔ <b>Stopped:</b> {stopped_count or 0} tokens\n\n"
+
+            def _metric(name: str) -> tuple[int, int]:
+                row = api_map.get(name, {})
+                return int(row.get("total_checks", 0) or 0), int(row.get("total_errors", 0) or 0)
+
+            def _daily_metric(name: str) -> tuple[int, int]:
+                row = api_24h_map.get(name, {})
+                return int(row.get("total_checks", 0) or 0), int(row.get("total_errors", 0) or 0)
+
+            j_checks, j_err = _metric("jupiter")
+            d_checks, d_err = _metric("dexpaprika")
+            x_checks, x_err = _metric("dexscreener")
+
+            j_checks_d, j_err_d = _daily_metric("jupiter")
+            d_checks_d, d_err_d = _daily_metric("dexpaprika")
+            x_checks_d, x_err_d = _daily_metric("dexscreener")
+
+            text += (
+                "<b>🌐 API Checks (All‑Time)</b>\n"
+                f"  ├ Jupiter: {j_checks} checks, {j_err} errors\n"
+                f"  ├ DexPaprika: {d_checks} checks, {d_err} errors\n"
+                f"  └ DexScreener: {x_checks} checks, {x_err} errors\n\n"
+                "<b>🌐 API Checks (Last 24h)</b>\n"
+                f"  ├ Jupiter: {j_checks_d} checks, {j_err_d} errors\n"
+                f"  ├ DexPaprika: {d_checks_d} checks, {d_err_d} errors\n"
+                f"  └ DexScreener: {x_checks_d} checks, {x_err_d} errors\n\n"
+                f"<b>🤖 AutoTrader Skips (24h):</b> {autotrader_skips_24h or 0}\n\n"
+                "<b>🧩 Missing Reasons</b>\n"
+            )
+
+            if missing_reason_rows:
+                for row in missing_reason_rows[:6]:
+                    reason = row["reason"]
+                    count = row["count"]
+                    text += f"  ├ {reason}: {count}\n"
+            else:
+                text += "  └ None\n"
+
+            text += "\n<b>📄 Missing Details</b>\n"
+            if missing_details:
+                for idx, row in enumerate(missing_details, start=1 + offset):
+                    address = row["address"] or "unknown"
+                    label = html.escape(row.get("label") or "-")
+                    reason = html.escape(row.get("reason") or "no_attempt")
+                    source = html.escape(row.get("source") or "-")
+                    detail_bits = []
+                    code = row.get("last_error_code")
+                    msg = row.get("last_error_message")
+                    at_local = row.get("last_error_at_local")
+                    target_local = row.get("target_time_local")
+                    if code is not None or msg:
+                        code_label = "-" if code is None else str(code)
+                        msg_label = html.escape(str(msg)) if msg else "-"
+                        if at_local:
+                            detail_bits.append(f"{code_label} {msg_label} @ {html.escape(str(at_local))}")
+                        else:
+                            detail_bits.append(f"{code_label} {msg_label}")
+                    if target_local:
+                        detail_bits.append(f"target={target_local}")
+
+                    suffix = ""
+                    if detail_bits:
+                        suffix = " | " + "; ".join(detail_bits)
+
+                    text += f"{idx}. {address[:8]} ({label}) — {reason} [{source}]{suffix}\n"
+                text += f"\nPage {page}/{total_pages}"
+            else:
+                text += "No missing timeframe details."
 
             await query.message.edit_text(
                 text,
-                reply_markup=self.keyboards.back_button("settings:token_status"),
+                reply_markup=self.keyboards.scheduler_overview_navigation(page, total_pages),
             )
             await query.answer()
 
@@ -641,7 +1281,7 @@ class SettingsHandler:
 
     async def show_tokens_list(self, query: types.CallbackQuery, status: str, page: int = 1) -> None:
         try:
-            items_per_page = 5
+            items_per_page = 9
             offset = (page - 1) * items_per_page
 
             tokens = await self.db.fetch(
@@ -748,3 +1388,83 @@ class SettingsHandler:
         if value >= 1_000:
             return f"${value / 1_000:.1f}K"
         return f"${value:.0f}"
+
+    async def cmd_timeframes(self, message: types.Message) -> None:
+        """List all hold timeframes."""
+        try:
+            timeframes = await self.analytics_model.get_hold_timeframes()
+
+            if not timeframes:
+                await message.answer("⏱ <b>No hold timeframes configured.</b>", parse_mode="HTML")
+                return
+
+            lines = ["⏱ <b>Hold Timeframes</b>", ""]
+            
+            defaults = [tf["label"] for tf in timeframes if tf["is_default"]]
+            if defaults:
+                lines.append("<b>Defaults (shown in /invest):</b>")
+                lines.append("✅ " + " | ✅ ".join(defaults))
+                lines.append("")
+
+            lines.append("<b>All available:</b>")
+            lines.append(", ".join([tf["label"] for tf in timeframes]))
+            
+            lines.append("\n<b>Commands:</b>")
+            lines.append("• <code>/addtimeframe &lt;label&gt; &lt;seconds&gt; [default]</code>")
+            lines.append("• <code>/deltimeframe &lt;label&gt;</code>")
+            lines.append("\n<i>Example: /addtimeframe 4h 14400 true</i>")
+
+            await message.answer("\n".join(lines), parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Error in cmd_timeframes: %s", exc)
+            await message.answer("❌ Failed to load timeframes.")
+
+    async def cmd_add_timeframe(self, message: types.Message) -> None:
+        """Add a new hold timeframe."""
+        try:
+            parts = message.text.split()
+            if len(parts) < 3:
+                await message.answer(
+                    "<b>Usage:</b>\n<code>/addtimeframe &lt;label&gt; &lt;seconds&gt; [default]</code>\n\n"
+                    "Example: <code>/addtimeframe 4h 14400 true</code>",
+                    parse_mode="HTML"
+                )
+                return
+
+            label = parts[1]
+            try:
+                seconds = int(parts[2])
+            except ValueError:
+                await message.answer("❌ Seconds must be an integer.")
+                return
+
+            is_default = False
+            if len(parts) > 3:
+                is_default = parts[3].lower() in ("true", "yes", "1")
+
+            success = await self.analytics_model.add_hold_timeframe(label, seconds, is_default)
+            if success:
+                await message.answer(f"✅ Timeframe <b>{label}</b> added ({seconds}s, default: {is_default})", parse_mode="HTML")
+            else:
+                await message.answer(f"❌ Failed to add timeframe <b>{label}</b>. It might already exist.", parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Error in cmd_add_timeframe: %s", exc)
+            await message.answer("❌ Error adding timeframe.")
+
+    async def cmd_del_timeframe(self, message: types.Message) -> None:
+        """Delete a hold timeframe."""
+        try:
+            parts = message.text.split()
+            if len(parts) < 2:
+                await message.answer("<b>Usage:</b>\n<code>/deltimeframe &lt;label&gt;</code>", parse_mode="HTML")
+                return
+
+            label = parts[1]
+            success = await self.analytics_model.delete_hold_timeframe(label)
+            if success:
+                await message.answer(f"✅ Timeframe <b>{label}</b> deleted.", parse_mode="HTML")
+            else:
+                await message.answer(f"❌ Timeframe <b>{label}</b> not found.", parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Error in cmd_del_timeframe: %s", exc)
+            await message.answer("❌ Error deleting timeframe.")

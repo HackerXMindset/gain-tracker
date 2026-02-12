@@ -56,6 +56,7 @@ class GainAlertDispatcher:
                     tga.last_alert_mc,
                     tga.original_user_id,
                     ms.id AS source_id,
+                    ms.user_id AS source_user_id,
                     ms.is_enabled,
                     ms.sensitivity_pct,
                     ms.assigned_userbot_id,
@@ -66,12 +67,23 @@ class GainAlertDispatcher:
                     ms.chart_mc_threshold,
                     ARRAY_REMOVE(ARRAY_AGG(mst.target_chat_id), NULL) AS extra_targets
                 FROM token_group_alerts tga
-                LEFT JOIN monitored_sources ms
-                    ON ms.chat_id = tga.chat_id
-                   AND (
-                        ms.user_id = tga.original_user_id
-                        OR ms.user_id IS NULL
-                   )
+                LEFT JOIN LATERAL (
+                    SELECT ms.*
+                    FROM monitored_sources ms
+                    WHERE ms.chat_id = tga.chat_id
+                      AND (
+                            ms.user_id = tga.original_user_id
+                            OR (ms.chat_type = 'group' AND ms.user_id IS NULL)
+                            OR (ms.chat_type IN ('channel', 'dm') AND ms.user_id IS NULL)
+                      )
+                    ORDER BY
+                        CASE
+                            WHEN ms.user_id = tga.original_user_id THEN 1
+                            WHEN ms.chat_type = 'group' AND ms.user_id IS NULL THEN 2
+                            ELSE 3
+                        END
+                    LIMIT 1
+                ) ms ON TRUE
                 LEFT JOIN monitored_source_targets mst ON mst.source_id = ms.id
                 WHERE tga.token_id = $1
                 GROUP BY
@@ -81,6 +93,7 @@ class GainAlertDispatcher:
                     tga.last_alert_mc,
                     tga.original_user_id,
                     ms.id,
+                    ms.user_id,
                     ms.is_enabled,
                     ms.sensitivity_pct,
                     ms.assigned_userbot_id,
@@ -250,13 +263,20 @@ class GainAlertDispatcher:
                         source_records = await self.source_model.get_by_chat(chat_id)
                         source_record = None
                         if source_records:
-                            for record in source_records:
-                                if (
-                                    record.get("user_id") == group.get("original_user_id")
-                                    or (record.get("user_id") is None and group.get("original_user_id") is None)
-                                ):
-                                    source_record = record
-                                    break
+                            source_id = group.get("source_id")
+                            if source_id is not None:
+                                source_record = next(
+                                    (record for record in source_records if record.get("id") == source_id),
+                                    None,
+                                )
+                            if source_record is None:
+                                for record in source_records:
+                                    if (
+                                        record.get("user_id") == group.get("original_user_id")
+                                        or (record.get("user_id") is None and group.get("original_user_id") is None)
+                                    ):
+                                        source_record = record
+                                        break
 
                         guardrails = await self.settings_model.resolve_chart_guardrails(source_record)
 
